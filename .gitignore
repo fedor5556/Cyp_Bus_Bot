@@ -24,3 +24,6 @@ logs/
 .idea/
 .DS_Store
 .cache.sqlite
+
+# Media
+pics/
