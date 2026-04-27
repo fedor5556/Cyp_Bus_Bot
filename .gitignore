@@ -1,0 +1,26 @@
+# Environment variables / Secrets
+.env
+
+# Database and raw data
+data/bus_data.db
+data/raw/
+
+# Python caching
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Logs
+logs/
+*.log
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+.cache.sqlite
