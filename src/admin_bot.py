@@ -56,10 +56,30 @@ async def _deploy_and_restart(update: Update, deploy_message: str, git_commands:
     else:
         await update.message.reply_text("✅ Dependencies up to date.")
 
-    # 3. Systemd-Native Restart
+    # 3. Native Restart
     if os.name == 'nt':
-        await update.message.reply_text("🔄 [Windows Local Dev] Skipping systemd restart. Please close and reopen the monitor window manually.")
-        await update.message.reply_text("🚀 Deployment complete! (Local mode)")
+        await update.message.reply_text("🔄 Restarting Windows services via taskkill and COMPLETE_LAUNCH.bat...")
+        
+        # Kill all running python instances EXCEPT the admin bot itself (by name if possible, or just all python.exe)
+        # Note: A simple 'taskkill /F /IM python.exe' would kill this bot mid-execution.
+        # So we specifically kill the known scripts: monitor.py and predict_eta.py (or whatever your bot script is named)
+        kill_monitor_cmd = ["taskkill", "/F", "/FI", "WINDOWTITLE eq Bus Monitor Orchestrator*"]
+        kill_bot_cmd = ["taskkill", "/F", "/FI", "WINDOWTITLE eq Public ETA Bot*"]
+        
+        await run_shell(kill_monitor_cmd, cwd=BASE_DIR)
+        await run_shell(kill_bot_cmd, cwd=BASE_DIR)
+
+        # Relaunch the batch files in new detached windows
+        monitor_bat = os.path.join(BASE_DIR, "run_monitor.bat")
+        bot_bat = os.path.join(BASE_DIR, "start_telegram_bot.bat")
+        
+        if os.path.exists(monitor_bat):
+            subprocess.Popen(["cmd.exe", "/c", "start", "Bus Monitor Orchestrator", monitor_bat], cwd=BASE_DIR)
+        if os.path.exists(bot_bat):
+            subprocess.Popen(["cmd.exe", "/c", "start", "Public ETA Bot", bot_bat], cwd=BASE_DIR)
+            
+        await update.message.reply_text("🚀 Deployment complete! Windows processes restarted.")
+        
     else:
         await update.message.reply_text("🔄 Restarting monitor service via systemd...")
         restart_cmd = ["sudo", "systemctl", "restart", MONITOR_SERVICE_NAME]
