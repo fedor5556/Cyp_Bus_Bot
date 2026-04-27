@@ -115,18 +115,26 @@ The system is built in Python using a modular architecture, significantly improv
 
 ---
 
-## Server Deployment Architecture (Pull-Based CI/CD)
-To allow remote updates via Telegram without requiring SSH access, the system utilizes a dual-process architecture managed by `systemd`. 
+## Server Deployment Architecture (Windows 11 Pull-Based CI/CD)
+The project has been migrated from a Linux Hetzner server to a dedicated **Windows 11** system. To allow remote updates via Telegram without requiring direct access to the Windows PC, the system utilizes a Git-based Pull CI/CD architecture.
 
-1. **`monitor.py` (The Main App):** Managed by the `cyprus-bus-monitor` systemd service. It runs the data ingestion and ETA prediction logic.
-2. **`admin_bot.py` (The Update Manager):** Managed by the `cyprus-bus-admin` systemd service. It is a lightweight, always-on Telegram bot that listens for deployment commands.
+1. **`COMPLETE_LAUNCH.bat`:** A single master batch script that launches all components in separate, titled Windows Command Prompts:
+   * **Data Orchestrator** (`run_monitor.bat`)
+   * **Public ETA Bot** (`start_telegram_bot.bat`)
+   * **Update Manager** (`src/admin_bot.py`)
+2. **`admin_bot.py` (The Update Manager):** A lightweight, always-on Telegram bot running locally on the Windows server that listens for deployment commands and natively manipulates Windows processes using `taskkill`.
+
+**The New Development Workflow:**
+1. Code changes (bug fixes, new ML features) are written locally on the developer's laptop.
+2. Changes are committed and pushed to GitHub: `git add .` -> `git commit -m "Update"` -> `git push`
+3. The developer sends the `/update` command to the Admin Telegram Bot.
 
 **Telegram Commands (Admin Only):**
-*   `/update`: Performs a "Nuke and Pave" update (`git fetch`, `git reset --hard origin/main`), runs `pip install`, and restarts the monitor service.
-*   `/rollback`: Reverts the codebase to the previous commit (`git reset --hard HEAD~1`) and restarts the monitor.
-*   `/status`: Checks if the admin bot and monitor service are running.
+*   `/update`: Performs a "Nuke and Pave" update (`git fetch`, `git reset --hard origin/main`), runs `pip install -r requirements.txt`, uses Windows `taskkill` to cleanly close the existing bot/monitor windows, and relaunches them via `COMPLETE_LAUNCH.bat`.
+*   `/rollback`: Reverts the server's codebase to the previous commit (`git reset --hard HEAD~1`) and restarts the processes.
+*   `/status`: Checks if the admin bot is online.
 
-**Server Setup Requirements (One-Time):**
-1. **Sudoers Bypass:** The server administrator must add the following line to `/etc/sudoers` (using `visudo`) to allow the bot to restart the monitor without a password prompt:
-   `youruser ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart cyprus-bus-monitor`
-2. **Environment File:** The server requires a `.env` file containing `ADMIN_TELEGRAM_ID` and `ADMIN_BOT_TOKEN` in the project root. This file is explicitly ignored by git.
+**Server Setup Requirements (One-Time on Windows 11 PC):**
+1. **Clone Repo:** Install Git, then `git clone https://github.com/fedor5556/Cyp_Bus_Bot.git`.
+2. **Environment File:** Create a `.env` file containing `ADMIN_TELEGRAM_ID` and `ADMIN_BOT_TOKEN` in the project root. Transfer this securely; it is explicitly ignored by git.
+3. **Launch:** Run `COMPLETE_LAUNCH.bat`. The Admin Bot will handle all future updates remotely.
