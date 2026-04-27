@@ -57,15 +57,20 @@ async def _deploy_and_restart(update: Update, deploy_message: str, git_commands:
         await update.message.reply_text("✅ Dependencies up to date.")
 
     # 3. Systemd-Native Restart
-    await update.message.reply_text("🔄 Restarting monitor service via systemd...")
-    restart_cmd = ["sudo", "systemctl", "restart", MONITOR_SERVICE_NAME]
-    code, stdout, stderr = await run_shell(restart_cmd, cwd=BASE_DIR)
-    
-    if code != 0:
-        await update.message.reply_text(f"❌ Systemd restart failed:\n<pre>{stderr}</pre>\nIs the sudoers file configured correctly?", parse_mode='HTML')
-        return False
+    if os.name == 'nt':
+        await update.message.reply_text("🔄 [Windows Local Dev] Skipping systemd restart. Please close and reopen the monitor window manually.")
+        await update.message.reply_text("🚀 Deployment complete! (Local mode)")
+    else:
+        await update.message.reply_text("🔄 Restarting monitor service via systemd...")
+        restart_cmd = ["sudo", "systemctl", "restart", MONITOR_SERVICE_NAME]
+        code, stdout, stderr = await run_shell(restart_cmd, cwd=BASE_DIR)
+        
+        if code != 0:
+            await update.message.reply_text(f"❌ Systemd restart failed:\n<pre>{stderr}</pre>\nIs the sudoers file configured correctly?", parse_mode='HTML')
+            return False
 
-    await update.message.reply_text("🚀 Deployment complete! The monitor has been restarted.")
+        await update.message.reply_text("🚀 Deployment complete! The monitor has been restarted.")
+        
     return True
 
 
@@ -96,8 +101,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Checks the status of the services."""
     if not await verify_user(update): return
         
-    code, stdout, stderr = await run_shell(["systemctl", "is-active", MONITOR_SERVICE_NAME], cwd=BASE_DIR)
-    status = stdout.strip() if code == 0 else f"Unknown ({stderr.strip()})"
+    if os.name == 'nt':
+        status = "Local Windows Dev Mode (systemd disabled)"
+    else:
+        code, stdout, stderr = await run_shell(["systemctl", "is-active", MONITOR_SERVICE_NAME], cwd=BASE_DIR)
+        status = stdout.strip() if code == 0 else f"Unknown ({stderr.strip()})"
     
     await update.message.reply_text(f"🤖 Admin Bot is Online.\n⚙️ Monitor Service Status: <b>{status}</b>", parse_mode='HTML')
 
