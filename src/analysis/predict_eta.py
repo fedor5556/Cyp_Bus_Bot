@@ -268,12 +268,13 @@ def predict_live_eta():
 
 async def bot_handler(update, context):
     user = update.message.from_user
-    allowed_users = os.environ.get("ALLOWED_TELEGRAM_USERS", "FedShved").split(",")
-    allowed_users = [u.strip().lstrip("@") for u in allowed_users]
-
-    if user.username not in allowed_users:
-        print(f"Unauthorized access attempt from user: {user.username}")
-        return
+    allowed_users_env = os.environ.get("ALLOWED_TELEGRAM_USERS")
+    
+    if allowed_users_env:
+        allowed_users = [u.strip().lstrip("@") for u in allowed_users_env.split(",")]
+        if user.username not in allowed_users:
+            print(f"Unauthorized access attempt from user: {user.username}")
+            return
 
     text = get_prediction_text()
     await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
