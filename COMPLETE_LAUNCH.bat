@@ -16,15 +16,15 @@ echo.
 
 :: 1. Launch the Main Data Monitor
 echo [LAUNCH] Starting Data Orchestrator (run_monitor.bat)...
-start "Bus Monitor Orchestrator" cmd /k "call run_monitor.bat"
+start "Bus Monitor Orchestrator" cmd /c "call run_monitor.bat"
 
 :: 2. Launch the Public/Main ETA Telegram Bot
 echo [LAUNCH] Starting Main ETA Telegram Bot (start_telegram_bot.bat)...
-start "Public ETA Bot" cmd /k "call start_telegram_bot.bat"
+start "Public ETA Bot" cmd /c "call start_telegram_bot.bat"
 
 :: 3. Launch the Admin Deployment/Maintenance Bot
 echo [LAUNCH] Starting Admin Maintenance Bot (src/admin_bot.py)...
-start "Admin Deployment Bot" cmd /k "python src\admin_bot.py"
+start "Admin Deployment Bot" cmd /c "python src\admin_bot.py"
 
 echo.
 echo ==============================================================

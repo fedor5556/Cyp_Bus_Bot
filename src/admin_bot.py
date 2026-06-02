@@ -92,8 +92,8 @@ async def _deploy_and_restart(update: Update, deploy_message: str, git_commands:
     if os.name == 'nt':
         await update.message.reply_text("🔄 Restarting Windows services via taskkill...")
         
-        kill_monitor_cmd = ["taskkill", "/F", "/FI", "WINDOWTITLE eq Bus Monitor Orchestrator*"]
-        kill_bot_cmd = ["taskkill", "/F", "/FI", "WINDOWTITLE eq Public ETA Bot*"]
+        kill_monitor_cmd = ["wmic", "process", "where", "name='python.exe' and commandline like '%monitor.py%'", "call", "terminate"]
+        kill_bot_cmd = ["wmic", "process", "where", "name='python.exe' and commandline like '%predict_eta.py%'", "call", "terminate"]
         
         await run_shell(kill_monitor_cmd, cwd=BASE_DIR)
         await run_shell(kill_bot_cmd, cwd=BASE_DIR)
@@ -494,8 +494,8 @@ async def _handle_db_restore(update, context, document, filename, file_ext):
         # Stop services
         await update.message.reply_text("🛑 Stopping monitor and ETA bot...")
         if os.name == 'nt':
-            await run_shell(["taskkill", "/F", "/FI", "WINDOWTITLE eq Bus Monitor Orchestrator*"], cwd=BASE_DIR)
-            await run_shell(["taskkill", "/F", "/FI", "WINDOWTITLE eq Public ETA Bot*"], cwd=BASE_DIR)
+            await run_shell(["wmic", "process", "where", "name='python.exe' and commandline like '%monitor.py%'", "call", "terminate"], cwd=BASE_DIR)
+            await run_shell(["wmic", "process", "where", "name='python.exe' and commandline like '%predict_eta.py%'", "call", "terminate"], cwd=BASE_DIR)
         time.sleep(2)
 
         # Backup current DB

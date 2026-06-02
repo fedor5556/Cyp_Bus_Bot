@@ -98,15 +98,23 @@ The system is built in Python using a modular architecture, significantly improv
 
 ---
 
-## Current Task Tracking: Phase 3 Preparation (April 7, 2026)
-**Objective:** With the pipeline successfully running on the Hetzner server, the system is now in an active data-collection phase. The next immediate tasks involve building the structural components of Phase 3 while we wait to accumulate a statistically significant month of data.
+## Current Task Tracking: Phase 3 Preparation (June 3, 2026)
+**Objective:** Pipeline successfully migrated from Hetzner to friend's Windows 11 PC. System is in active data-collection phase. Next steps: build Phase 3 structural components while accumulating data.
+
+**Server Status (as of June 3, 2026):**
+*   GPS Pings: **196,232** rows
+*   Stop Events: **427** rows
+*   DB Size: **42.5 MB**
+*   Platform: Windows 11 (friend's PC)
 
 ### Progress Checklist (Next Steps):
-- [ ] **Infrastructure:** Execute PostgreSQL + PostGIS database migration on the Hetzner server using `migrate_db.py` to prepare for spatial indexing.
+- [x] **Infrastructure:** Migrate pipeline from Hetzner to friend's Windows 11 PC.
+- [x] **Infrastructure:** Set up Git-based CI/CD with Admin Telegram Bot.
+- [x] **Infrastructure:** Implement Telegram-based data sync (`/backup`, `/restore`, `/upload_model`).
 - [ ] **Data Pipeline:** Build the `PredictionLog` schema and background ETA logging logic.
-- [ ] **Data Pipeline:** Build the `prepare_training_data.py` script to successfully join weather, delay, upstream, and prediction delta data into a tabular format.
-- [ ] **Spatial Logic:** Begin developing the Route Polyline Snapping script using `shapes.txt` to test accurate on-road distance calculations.
-- [ ] **Data Collection:** Allow the server to run continuously for ~4 weeks to capture weekly seasonality, weather patterns, and sufficient empirical schedules.
+- [ ] **Data Pipeline:** Build the `prepare_training_data.py` script to join weather, delay, upstream, and prediction delta data.
+- [ ] **Spatial Logic:** Begin developing the Route Polyline Snapping script using `shapes.txt`.
+- [ ] **Data Collection:** Allow the server to run continuously for ~4 weeks to capture weekly seasonality.
 ### Technical Notes:
 *   **Towards Lemesos Stop:** `5411`
 *   **Towards Sanida Stop:** `7604`
@@ -116,29 +124,62 @@ The system is built in Python using a modular architecture, significantly improv
 ---
 
 ## Server Deployment Architecture (Windows 11 Pull-Based CI/CD)
-The project has been migrated from a Linux Hetzner server to a dedicated **Windows 11** system. To allow remote updates via Telegram without requiring direct access to the Windows PC, the system utilizes a Git-based Pull CI/CD architecture.
+The project was originally deployed on a Linux Hetzner server (Feb–Jun 2026 for data collection) and has been migrated to a dedicated **Windows 11 PC** hosted by a friend for 24/7 operation.
 
-1. **`COMPLETE_LAUNCH.bat`:** A single master batch script that launches all components in separate, titled Windows Command Prompts:
-   * **Data Orchestrator** (`run_monitor.bat`)
-   * **Public ETA Bot** (`start_telegram_bot.bat`)
-   * **Update Manager** (`src/admin_bot.py`)
-2. **`admin_bot.py` (The Update Manager):** A lightweight, always-on Telegram bot running locally on the Windows server that listens for deployment commands and natively manipulates Windows processes using `taskkill`.
+> **CRITICAL HOST REQUIREMENT:** The entire project MUST remain self-contained within a single root folder (e.g., `C:\CypBusBot`). The host may relocate this folder at any time. All paths must be relative or auto-detected. No files should be written outside the project root.
 
-**The New Development Workflow:**
-1. Code changes (bug fixes, new ML features) are written locally on the developer's laptop.
-2. Changes are committed and pushed to GitHub: `git add .` -> `git commit -m "Update"` -> `git push`
-3. The developer sends the `/update` command to the Admin Telegram Bot.
+### Three-Machine Architecture
 
-**Telegram Commands (Admin Only):**
-*   `/update`: Performs a "Nuke and Pave" update (`git fetch`, `git reset --hard origin/main`), runs `pip install -r requirements.txt`, uses Windows `taskkill` to cleanly close the existing bot/monitor windows, and relaunches them via `COMPLETE_LAUNCH.bat`.
-*   `/rollback`: Reverts the server's codebase to the previous commit (`git reset --hard HEAD~1`) and restarts the processes.
-*   `/status`: Checks if the admin bot is online.
+```
+Developer PC ──git push──> GitHub ──/update──> Friend's Win11 PC (Server)
+     ^                                              │
+     └──────── /backup (Telegram file) ─────────────┘
+```
 
-**Server Setup Requirements (One-Time on Windows 11 PC):**
-1. **Clone Repo:** Install Git, then `git clone https://github.com/fedor5556/Cyp_Bus_Bot.git`.
-2. **Environment File:** Create a `.env` file containing `ADMIN_TELEGRAM_ID` and `ADMIN_BOT_TOKEN` in the project root. Transfer this securely; it is explicitly ignored by git.
-3. **Data Transfer (CRITICAL):** Because the SQLite database operates in high-performance Write-Ahead Logging (WAL) mode, you MUST manually copy all three database files from the Linux server to the Windows `data/` folder to prevent severe data loss:
-   * `bus_data.db` (Main database)
-   * `bus_data.db-wal` (Recent unmerged writes)
-   * `bus_data.db-shm` (Shared memory index)
-4. **Launch:** Run `COMPLETE_LAUNCH.bat`. The Admin Bot will handle all future updates remotely.
+1.  **Developer PC:** Code editing, ML training (heavy compute). Pushes code to GitHub via `push.bat`.
+2.  **GitHub:** Code-only repository. No data files (DB, models >100MB). Acts as the relay.
+3.  **Friend's Win11 PC:** 24/7 data collection server. Pulls code from GitHub via Admin Bot.
+
+### Process Architecture
+**`COMPLETE_LAUNCH.bat`** opens three separate terminal windows:
+   * **"Bus Monitor Orchestrator"** → `run_monitor.bat` → `src/monitor.py`
+   * **"Public ETA Bot"** → `start_telegram_bot.bat` → `src/analysis/predict_eta.py --bot`
+   * **"Admin Deployment Bot"** → `python src/admin_bot.py`
+
+### Admin Telegram Bot Commands (All Admin-Only)
+**Deployment:**
+*   `/update` or `/deploy`: "Nuke and Pave" — `git fetch` + `git reset --hard origin/main` + `pip install` + `taskkill` + relaunch.
+*   `/rollback`: Reverts to previous commit (`git reset --hard HEAD~1`) + restart.
+
+**Monitoring:**
+*   `/status`: Shows last commit hash, bot uptime, DB size, GPS ping count, stop event count, free disk space, platform.
+*   `/dbstats`: Detailed per-table row counts, date ranges, delay calculation progress.
+*   `/logs`: Shows recent stop events or log file contents.
+
+**Data Sync (via Telegram file transfer, up to 2 GB):**
+*   `/backup`: Uses SQLite backup API to create a safe snapshot → ZIP → sends as Telegram document.
+*   `/restore`: Accepts a `.db` or `.zip` file upload → stops services → backs up current DB → replaces → restarts.
+*   `/upload_model`: Accepts `.pkl`/`.joblib`/`.json` file → saves to `src/models/` directory.
+
+**Other:**
+*   `/help` or `/start`: Shows all available commands.
+
+### Security Model
+*   **Authentication:** Every command and file upload handler checks the sender's Telegram User ID against the `ADMIN_TELEGRAM_ID` environment variable (comma-separated list). Unauthorized users receive "⛔ Unauthorized" and the command is rejected.
+*   **Telegram User IDs** are cryptographic identifiers assigned by Telegram's servers — they cannot be spoofed or forged by end users.
+*   **Bot tokens** are stored in `.env` which is excluded from Git via `.gitignore`. Tokens are transferred to the server via secure offline methods (ZIP package), never through GitHub.
+*   **Current authorized admins:** 2 users (developer + friend).
+*   **No open ports:** The server does not expose any network ports. All communication goes through Telegram's API (outbound HTTPS only). There is no SSH, no web server, and no way to connect to the machine remotely except through the Telegram bot.
+
+### Data Sync Workflow
+Because GitHub blocks files >100 MB and the SQLite database will grow continuously:
+1.  **Getting data for ML training:** Developer sends `/backup` → bot sends ZIP via Telegram → developer downloads and trains locally.
+2.  **Pushing small models (<100 MB):** Commit to `src/models/` → `git push` → `/update`.
+3.  **Pushing large models (>100 MB):** Send file directly to admin bot in Telegram → auto-saved to `src/models/`.
+
+### Initial Server Setup (One-Time)
+The setup is automated via `setup/SETUP.bat` included in a ZIP package:
+1.  Friend receives ZIP containing `SETUP.bat`, `SETUP_README.txt`, and `server_data/` (with `.env` + DB files).
+2.  Friend unzips and double-clicks `SETUP.bat`.
+3.  Script validates Python/Git → clones repo → copies `.env` + DB → creates venv → installs deps → launches `COMPLETE_LAUNCH.bat`.
+4.  All future updates are handled remotely via `/update` command.
