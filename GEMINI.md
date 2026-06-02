@@ -137,4 +137,8 @@ The project has been migrated from a Linux Hetzner server to a dedicated **Windo
 **Server Setup Requirements (One-Time on Windows 11 PC):**
 1. **Clone Repo:** Install Git, then `git clone https://github.com/fedor5556/Cyp_Bus_Bot.git`.
 2. **Environment File:** Create a `.env` file containing `ADMIN_TELEGRAM_ID` and `ADMIN_BOT_TOKEN` in the project root. Transfer this securely; it is explicitly ignored by git.
-3. **Launch:** Run `COMPLETE_LAUNCH.bat`. The Admin Bot will handle all future updates remotely.
+3. **Data Transfer (CRITICAL):** Because the SQLite database operates in high-performance Write-Ahead Logging (WAL) mode, you MUST manually copy all three database files from the Linux server to the Windows `data/` folder to prevent severe data loss:
+   * `bus_data.db` (Main database)
+   * `bus_data.db-wal` (Recent unmerged writes)
+   * `bus_data.db-shm` (Shared memory index)
+4. **Launch:** Run `COMPLETE_LAUNCH.bat`. The Admin Bot will handle all future updates remotely.

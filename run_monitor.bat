@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 echo ==================================================
 echo STARTING CYPRUS BUS MONITORING SYSTEM
 echo ==================================================
