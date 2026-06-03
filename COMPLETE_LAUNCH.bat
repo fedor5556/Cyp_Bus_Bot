@@ -22,7 +22,7 @@ echo.
 
 :: Auto-install/verify all dependencies
 echo [INFO] Checking dependencies...
-pip install -r requirements.txt --quiet --disable-pip-version-check 2>nul
+venv\Scripts\python.exe -m pip install -r requirements.txt
 if %ERRORLEVEL% == 0 (
     echo [OK] All dependencies verified.
 ) else (
