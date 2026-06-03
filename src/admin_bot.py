@@ -367,33 +367,36 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Shows the last 20 lines of monitor and bot output."""
     if not await verify_user(update): return
     
-    logs_to_check = {
-        "Monitor": os.path.join(BASE_DIR, 'logs', 'monitor.log'),
-        "Telegram Bot": os.path.join(BASE_DIR, 'logs', 'telegram_bot.log')
-    }
+    logs_dir = os.path.join(BASE_DIR, 'logs')
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir, exist_ok=True)
+        
+    import glob
+    log_files = glob.glob(os.path.join(logs_dir, '*.log'))
     
     msg_parts = []
     
-    for name, log_file in logs_to_check.items():
-        if os.path.exists(log_file):
+    if log_files:
+        for log_file in log_files:
+            name = os.path.basename(log_file)
             try:
                 with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
                     lines = f.readlines()
-                last_20 = lines[-20:] if len(lines) > 20 else lines
+                last_20 = lines[-15:] if len(lines) > 15 else lines
                 content = "".join(last_20).strip()
                 # PowerShell Tee-Object writes in UTF-16 by default, causing null bytes
                 content = content.replace('\x00', '')
                 if not content:
                     content = "[File is empty]"
-                elif len(content) > 1500:
-                    content = content[-1500:]
+                elif len(content) > 1000:
+                    content = content[-1000:]
                 msg_parts.append(f"📋 <b>{name} (Last {len(last_20)} lines):</b>\n<pre>{content}</pre>")
             except Exception as e:
-                msg_parts.append(f"❌ Error reading {name} log: {str(e)[:100]}")
-        else:
-            msg_parts.append(f"⚠️ {name} log not found.")
+                msg_parts.append(f"❌ Error reading {name}: {str(e)[:100]}")
+    else:
+        msg_parts.append("⚠️ No .log files found in the logs directory.")
             
-    if not any(os.path.exists(p) for p in logs_to_check.values()):
+    if not log_files:
         # Try DB proxy if no logs exist
         try:
             conn = sqlite3.connect(DB_PATH)

@@ -41,8 +41,9 @@ start "Public ETA Bot" cmd /c "call start_telegram_bot.bat"
 
 :: 3. Launch the Admin Deployment/Maintenance Bot
 echo [LAUNCH] Starting Admin Maintenance Bot (src/admin_bot.py)...
-:: Using cmd /k so if it crashes, the window stays open to show the error!
-start "Admin Deployment Bot" cmd /k ""%PYTHON_CMD%" src\admin_bot.py"
+:: Using powershell to Tee the output to a log file, keeping the window open
+if not exist logs mkdir logs
+start "Admin Deployment Bot" powershell -NoProfile -Command "& '%PYTHON_CMD%' -u src\admin_bot.py 2>&1 | Tee-Object -FilePath logs\admin_bot.log; Read-Host 'Press Enter to exit'"
 
 echo.
 echo ==============================================================
