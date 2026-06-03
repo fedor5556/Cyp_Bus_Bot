@@ -662,12 +662,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     if not BOT_TOKEN:
-        print("❌ Error: ADMIN_BOT_TOKEN not found in .env")
+        print("Error: ADMIN_BOT_TOKEN not found in .env")
         return
     if not ADMIN_TELEGRAM_ID:
-        print("⚠️ Warning: ADMIN_TELEGRAM_ID not set in .env. Bot will reject all commands.")
+        print("Warning: ADMIN_TELEGRAM_ID not set in .env. Bot will reject all commands.")
 
-    print("🚀 Starting Admin Deployment Bot...")
+    print("Starting Admin Deployment Bot...")
     print(f"   Project root: {BASE_DIR}")
     print(f"   Database: {DB_PATH}")
     print(f"   Authorized admins: {ADMIN_TELEGRAM_ID}")
@@ -696,7 +696,7 @@ def main():
     # File upload handler (auto-detects DB vs model files)
     app.add_handler(MessageHandler(filters.Document.ALL, handle_file_upload))
 
-    print("✅ Bot is running. Waiting for commands...")
+    print("Bot is running. Waiting for commands...")
     app.run_polling()
 
 
