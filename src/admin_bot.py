@@ -144,21 +144,15 @@ async def _deploy_and_restart(update: Update, deploy_message: str, git_commands:
     await update.message.reply_text("✅ Git operation successful. Installing dependencies...")
 
     # 2. Automated pip install
-    if os.name == 'nt':
-        pip_path = os.path.join(BASE_DIR, 'venv', 'Scripts', 'pip.exe')
-    else:
-        pip_path = os.path.join(BASE_DIR, 'venv', 'bin', 'pip')
-    
-    if os.path.exists(pip_path):
-        pip_cmd = [pip_path, "install", "-r", "requirements.txt", "--quiet"]
-    else:
-        pip_cmd = ["pip", "install", "-r", "requirements.txt", "--quiet"]
+    await update.message.reply_text("📦 Installing/verifying pip dependencies...")
+    pip_cmd = [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
     
     code, stdout, stderr = await run_shell(pip_cmd, cwd=BASE_DIR)
     if code != 0:
-        await update.message.reply_text(f"⚠️ Warning: pip install had issues:\n<pre>{stderr[:500]}</pre>\nContinuing anyway...", parse_mode='HTML')
+        await update.message.reply_text(f"⚠️ Warning: pip install had issues:\n<pre>{stderr[-1000:]}</pre>\nContinuing anyway...", parse_mode='HTML')
     else:
-        await update.message.reply_text("✅ Dependencies up to date.")
+        # Show the last 500 chars of stdout to prove it worked
+        await update.message.reply_text(f"✅ Dependencies up to date.\n<pre>{stdout[-500:]}</pre>", parse_mode='HTML')
 
     # 3. Native Restart
     if os.name == 'nt':
@@ -370,23 +364,35 @@ async def dbstats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Shows the last 30 lines of monitor output (if logging to file)."""
+    """Shows the last 20 lines of monitor and bot output."""
     if not await verify_user(update): return
     
-    # Check for common log locations
-    log_paths = [
-        os.path.join(BASE_DIR, 'logs', 'monitor.log'),
-        os.path.join(BASE_DIR, 'monitor.log'),
-    ]
+    logs_to_check = {
+        "Monitor": os.path.join(BASE_DIR, 'logs', 'monitor.log'),
+        "Telegram Bot": os.path.join(BASE_DIR, 'logs', 'telegram_bot.log')
+    }
     
-    log_file = None
-    for path in log_paths:
-        if os.path.exists(path):
-            log_file = path
-            break
+    msg_parts = []
     
-    if not log_file:
-        # No log file - try to get recent StopEvents as a proxy for "is it working?"
+    for name, log_file in logs_to_check.items():
+        if os.path.exists(log_file):
+            try:
+                with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                    lines = f.readlines()
+                last_20 = lines[-20:] if len(lines) > 20 else lines
+                content = "".join(last_20).strip()
+                if not content:
+                    content = "[File is empty]"
+                elif len(content) > 1500:
+                    content = content[-1500:]
+                msg_parts.append(f"📋 <b>{name} (Last {len(last_20)} lines):</b>\n<pre>{content}</pre>")
+            except Exception as e:
+                msg_parts.append(f"❌ Error reading {name} log: {str(e)[:100]}")
+        else:
+            msg_parts.append(f"⚠️ {name} log not found.")
+            
+    if not any(os.path.exists(p) for p in logs_to_check.values()):
+        # Try DB proxy if no logs exist
         try:
             conn = sqlite3.connect(DB_PATH)
             rows = conn.execute(
@@ -396,28 +402,16 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             
             if rows:
-                lines = ["📋 <b>Recent Stop Events</b> (no log file found)\n"]
-                for r in rows:
-                    lines.append(f"  🚌 {r[0]} | trip {r[1]} | {r[2][:19]}")
-                msg = "\n".join(lines)
-            else:
-                msg = "📋 No log file found and no stop events recorded yet."
+                msg_parts.append("\n📋 <b>Recent DB Stop Events</b> (as proxy for activity)\n" + 
+                               "\n".join([f"  🚌 {r[0]} | trip {r[1]} | {r[2][:19]}" for r in rows]))
         except Exception as e:
-            msg = f"📋 No log file found. DB query error: {str(e)[:200]}"
-    else:
-        try:
-            with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
-            last_30 = lines[-30:] if len(lines) > 30 else lines
-            content = "".join(last_30).strip()
-            # Telegram message limit is 4096 chars
-            if len(content) > 3800:
-                content = content[-3800:]
-            msg = f"📋 <b>Last {len(last_30)} log lines:</b>\n<pre>{content}</pre>"
-        except Exception as e:
-            msg = f"❌ Error reading log: {str(e)[:300]}"
-    
-    await update.message.reply_text(msg, parse_mode='HTML')
+            pass
+            
+    final_msg = "\n\n".join(msg_parts)
+    if len(final_msg) > 4000:
+        final_msg = final_msg[-4000:]
+        
+    await update.message.reply_text(final_msg, parse_mode='HTML')
 
 
 # ===================================================================
