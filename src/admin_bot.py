@@ -381,6 +381,8 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     lines = f.readlines()
                 last_20 = lines[-20:] if len(lines) > 20 else lines
                 content = "".join(last_20).strip()
+                # PowerShell Tee-Object writes in UTF-16 by default, causing null bytes
+                content = content.replace('\x00', '')
                 if not content:
                     content = "[File is empty]"
                 elif len(content) > 1500:
