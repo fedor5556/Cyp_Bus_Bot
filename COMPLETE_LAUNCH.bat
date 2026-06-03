@@ -14,6 +14,16 @@ if exist "venv\Scripts\activate.bat" (
 )
 echo.
 
+:: Auto-install/verify all dependencies
+echo [INFO] Checking dependencies...
+pip install -r requirements.txt --quiet --disable-pip-version-check 2>nul
+if %ERRORLEVEL% == 0 (
+    echo [OK] All dependencies verified.
+) else (
+    echo [WARNING] Some dependency issues detected. Continuing anyway...
+)
+echo.
+
 :: 1. Launch the Main Data Monitor
 echo [LAUNCH] Starting Data Orchestrator (run_monitor.bat)...
 start "Bus Monitor Orchestrator" cmd /c "call run_monitor.bat"
