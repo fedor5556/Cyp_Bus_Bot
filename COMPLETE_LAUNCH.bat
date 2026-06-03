@@ -40,7 +40,7 @@ start "Public ETA Bot" cmd /c "call start_telegram_bot.bat"
 
 :: 3. Launch the Admin Deployment/Maintenance Bot
 echo [LAUNCH] Starting Admin Maintenance Bot (src/admin_bot.py)...
-start "Admin Deployment Bot" cmd /c "python src\admin_bot.py"
+start "Admin Deployment Bot" cmd /c "venv\Scripts\python.exe src\admin_bot.py"
 
 echo.
 echo ==============================================================
