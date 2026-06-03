@@ -54,6 +54,78 @@ async def run_shell(command: list, cwd: str) -> tuple[int, str, str]:
         return 1, "", str(e)
 
 
+def kill_project_processes():
+    """Kill ONLY Python processes belonging to THIS project directory.
+    
+    Strategy: The batch files activate the project's venv before running scripts,
+    so the Python executable path will be something like:
+      C:\\Users\\chapl\\Desktop\\...\\Bus Bot\\venv\\Scripts\\python.exe
+    
+    We match against the project's venv path to identify our processes.
+    The admin_bot.py process is explicitly excluded so it stays alive.
+    This ensures the host's own Python processes are never touched.
+    """
+    if os.name != 'nt':
+        return 0
+    
+    # The venv Python executable is inside our project directory
+    venv_python = os.path.join(BASE_DIR, 'venv')
+    
+    # Also match script names as fallback (in case system Python is used)
+    script_names = ['monitor.py', 'predict_eta.py']
+    
+    killed = []
+    try:
+        # Use PowerShell to get all python.exe processes with their details
+        ps_cmd = "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Select-Object ProcessId, ExecutablePath, CommandLine | ConvertTo-Json"
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, check=False, timeout=15
+        )
+        
+        if result.returncode != 0 or not result.stdout.strip():
+            return 1
+        
+        import json
+        procs = json.loads(result.stdout)
+        # PowerShell returns a single object (not list) when there's only 1 result
+        if isinstance(procs, dict):
+            procs = [procs]
+        
+        for proc in procs:
+            pid = proc.get('ProcessId')
+            exe_path = proc.get('ExecutablePath') or ''
+            cmd_line = proc.get('CommandLine') or ''
+            
+            # Skip admin_bot (that's us!)
+            if 'admin_bot' in cmd_line:
+                continue
+            
+            # Match: python executable is inside our project's venv
+            is_our_venv = venv_python.lower() in exe_path.lower()
+            
+            # Fallback match: command line contains one of our script names
+            # AND the executable or command contains our project path
+            is_our_script = any(s in cmd_line for s in script_names) and BASE_DIR.lower() in (exe_path + cmd_line).lower()
+            
+            if is_our_venv or is_our_script:
+                try:
+                    subprocess.run(
+                        ["taskkill", "/F", "/PID", str(pid)],
+                        capture_output=True, check=False, timeout=5
+                    )
+                    killed.append(pid)
+                except Exception:
+                    pass
+        
+        print(f"kill_project_processes: killed PIDs {killed}" if killed else "kill_project_processes: no matching processes found")
+        return 0
+        
+    except Exception as e:
+        print(f"kill_project_processes error: {e}")
+        return 1
+
+
 # ===================================================================
 # DEPLOYMENT COMMANDS
 # ===================================================================
@@ -90,13 +162,9 @@ async def _deploy_and_restart(update: Update, deploy_message: str, git_commands:
 
     # 3. Native Restart
     if os.name == 'nt':
-        await update.message.reply_text("🔄 Restarting Windows services via taskkill...")
+        await update.message.reply_text(f"🔄 Stopping project processes in:\n<code>{BASE_DIR}</code>", parse_mode='HTML')
         
-        kill_monitor_cmd = ["wmic", "process", "where", "name='python.exe' and commandline like '%monitor.py%'", "call", "terminate"]
-        kill_bot_cmd = ["wmic", "process", "where", "name='python.exe' and commandline like '%predict_eta.py%'", "call", "terminate"]
-        
-        await run_shell(kill_monitor_cmd, cwd=BASE_DIR)
-        await run_shell(kill_bot_cmd, cwd=BASE_DIR)
+        kill_project_processes()
 
         # Small delay to let processes fully terminate
         time.sleep(2)
@@ -494,8 +562,7 @@ async def _handle_db_restore(update, context, document, filename, file_ext):
         # Stop services
         await update.message.reply_text("🛑 Stopping monitor and ETA bot...")
         if os.name == 'nt':
-            await run_shell(["wmic", "process", "where", "name='python.exe' and commandline like '%monitor.py%'", "call", "terminate"], cwd=BASE_DIR)
-            await run_shell(["wmic", "process", "where", "name='python.exe' and commandline like '%predict_eta.py%'", "call", "terminate"], cwd=BASE_DIR)
+            kill_project_processes()
         time.sleep(2)
 
         # Backup current DB
