@@ -6,23 +6,24 @@ echo      Starting Cyprus Bus Analysis Pipeline ^& Bots
 echo ==============================================================
 echo.
 
-:: Activate virtual environment if it exists
-if exist "venv\Scripts\activate.bat" (
-    echo [INFO] Activating virtual environment...
-    call venv\Scripts\activate.bat
+:: Determine the correct Python executable
+set "PYTHON_CMD=python"
+if exist "venv\Scripts\python.exe" (
+    set "PYTHON_CMD=%~dp0venv\Scripts\python.exe"
+    echo [INFO] Virtual environment found.
 ) else (
-    echo [WARNING] Virtual environment not found. Using system Python.
+    echo [WARNING] Virtual environment not found! Using system Python.
 )
 echo.
 
 :: Kill any existing project processes (including zombies from old folders)
 echo [INFO] Cleaning up old processes...
-python src\stop_processes.py
+"%PYTHON_CMD%" src\stop_processes.py
 echo.
 
 :: Auto-install/verify all dependencies
 echo [INFO] Checking dependencies...
-venv\Scripts\python.exe -m pip install -r requirements.txt
+"%PYTHON_CMD%" -m pip install -r requirements.txt
 if %ERRORLEVEL% == 0 (
     echo [OK] All dependencies verified.
 ) else (
@@ -40,7 +41,8 @@ start "Public ETA Bot" cmd /c "call start_telegram_bot.bat"
 
 :: 3. Launch the Admin Deployment/Maintenance Bot
 echo [LAUNCH] Starting Admin Maintenance Bot (src/admin_bot.py)...
-start "Admin Deployment Bot" cmd /c "venv\Scripts\python.exe src\admin_bot.py"
+:: Using cmd /k so if it crashes, the window stays open to show the error!
+start "Admin Deployment Bot" cmd /k ""%PYTHON_CMD%" src\admin_bot.py"
 
 echo.
 echo ==============================================================

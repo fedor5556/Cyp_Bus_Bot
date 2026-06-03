@@ -6,11 +6,13 @@ echo      Stopping ONLY Bus Bot processes...
 echo ==============================================================
 echo.
 
-if exist "venv\Scripts\activate.bat" (
-    call venv\Scripts\activate.bat
+:: Determine the correct Python executable
+set "PYTHON_CMD=python"
+if exist "venv\Scripts\python.exe" (
+    set "PYTHON_CMD=%~dp0venv\Scripts\python.exe"
 )
 
-python src\stop_processes.py
+"%PYTHON_CMD%" src\stop_processes.py
 
 echo.
 echo ==============================================================
