@@ -105,8 +105,8 @@ def kill_project_processes():
             is_our_venv = venv_python.lower() in exe_path.lower()
             
             # Fallback match: command line contains one of our script names
-            # AND the executable or command contains our project path
-            is_our_script = any(s in cmd_line for s in script_names) and BASE_DIR.lower() in (exe_path + cmd_line).lower()
+            # This also catches zombie processes from old/moved directories
+            is_our_script = any(s in cmd_line for s in script_names)
             
             if is_our_venv or is_our_script:
                 try:

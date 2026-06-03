@@ -1,4 +1,5 @@
 @echo off
+cd /d "%~dp0"
 TITLE Cyprus Bus Analysis - COMPLETE LAUNCH
 echo ==============================================================
 echo      Starting Cyprus Bus Analysis Pipeline ^& Bots
@@ -12,6 +13,11 @@ if exist "venv\Scripts\activate.bat" (
 ) else (
     echo [WARNING] Virtual environment not found. Using system Python.
 )
+echo.
+
+:: Kill any existing project processes (including zombies from old folders)
+echo [INFO] Cleaning up old processes...
+python src\stop_processes.py
 echo.
 
 :: Auto-install/verify all dependencies
