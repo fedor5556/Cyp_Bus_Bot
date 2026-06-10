@@ -6,6 +6,18 @@ echo      Starting Cyprus Bus Analysis Pipeline ^& Bots
 echo ==============================================================
 echo.
 
+if not exist logs mkdir logs
+if exist logs\runner.stop del logs\runner.stop
+
+:: If the central runner (Admin_hub\runner.py) is alive, hand off to it: it
+:: starts this project's processes hidden and keeps them alive. Otherwise
+:: fall back to the legacy visible-window launch below.
+powershell -NoProfile -Command "$r = Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -match 'runner\.py' }; if ($r) { exit 0 } else { exit 1 }"
+if %ERRORLEVEL%==0 goto :runner
+
+echo [WARN] Central runner not detected - legacy visible-window launch.
+echo.
+
 :: Determine the correct Python executable
 set "PYTHON_CMD=python"
 if exist "venv\Scripts\python.exe" (
@@ -24,11 +36,6 @@ echo.
 :: Auto-install/verify all dependencies
 echo [INFO] Checking dependencies...
 "%PYTHON_CMD%" -m pip install -r requirements.txt
-if %ERRORLEVEL% == 0 (
-    echo [OK] All dependencies verified.
-) else (
-    echo [WARNING] Some dependency issues detected. Continuing anyway...
-)
 echo.
 
 :: 1. Launch the Main Data Monitor
@@ -38,11 +45,11 @@ start "Bus Monitor Orchestrator" cmd /c "call run_monitor.bat"
 :: 2. Launch the Public/Main ETA Telegram Bot
 echo [LAUNCH] Starting Main ETA Telegram Bot (start_telegram_bot.bat)...
 start "Public ETA Bot" cmd /c "call start_telegram_bot.bat"
-
-
 echo.
-echo ==============================================================
-echo  All systems launched in separate terminal windows.
-echo  You can close this main window safely.
-echo ==============================================================
-pause
+echo All systems launched in separate terminal windows.
+exit /b 0
+
+:runner
+echo [INFO] Central runner detected - requesting hidden (re)start.
+echo start > logs\runner.start
+exit /b 0
