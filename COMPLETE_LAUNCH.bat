@@ -47,9 +47,11 @@ echo [LAUNCH] Starting Main ETA Telegram Bot (start_telegram_bot.bat)...
 start "Public ETA Bot" cmd /c "call start_telegram_bot.bat"
 echo.
 echo All systems launched in separate terminal windows.
-exit /b 0
+:: plain "exit" (not /b): the Hub starts this bat via `start`, which keeps the
+:: console open after the script ends - exit closes the window too.
+exit 0
 
 :runner
 echo [INFO] Central runner detected - requesting hidden (re)start.
 echo start > logs\runner.start
-exit /b 0
+exit 0
