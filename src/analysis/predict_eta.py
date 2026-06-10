@@ -283,6 +283,9 @@ def start_bot():
     from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
     import logging
     logging.basicConfig(level=logging.INFO)
+    # httpx logs every Telegram API request at INFO - including the bot token
+    # in the URL. Keep it out of the persistent log file.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         print("Error: TELEGRAM_BOT_TOKEN not found in environment. Please add it to your .env file.")
@@ -303,6 +306,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.bot:
+        import log_tee
+        log_tee.setup("telegram_bot")
         start_bot()
     else:
         predict_live_eta()

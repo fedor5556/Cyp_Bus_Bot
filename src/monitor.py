@@ -77,4 +77,6 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
             print(f"Failed to trigger crash alert: {alert_e}")
 
 if __name__ == "__main__":
+    import log_tee
+    log_tee.setup("monitor")
     start_monitoring()
