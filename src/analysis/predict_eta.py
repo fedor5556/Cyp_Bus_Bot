@@ -1,5 +1,9 @@
 import os
+import re
 import sys
+import json
+import shutil
+import asyncio
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
@@ -279,9 +283,248 @@ async def bot_handler(update, context):
     text = get_prediction_text()
     await update.message.reply_text(f"<pre>{text}</pre>", parse_mode="HTML")
 
+# --- Admin-gated inbound file channel + cloud transfer commands -------------------
+# This ETA bot is PUBLIC by design, so these handlers gate on the numeric Telegram
+# user ID (Config.ADMIN_IDS, unforgeable). They restore the inbound-file capability
+# the send-only Admin Hub lacks WITHOUT touching the Hub. Two inbound paths:
+#   1. DM a .env document (caption or filename names the target project) -> written
+#      to that sibling project's folder. Telegram's ~20 MB inbound cap is plenty.
+#   2. DM a .json document (or /armb2) carrying the B2 application key -> arms the
+#      cloud layer in cloud_sync.py for large files (DB backups, ML models).
+
+# Holds the single-instance lock socket for the process lifetime (see start_bot).
+_SINGLE_INSTANCE_LOCK = None
+
+# Friendly names for .env routing. Any exact sibling folder name also works, so
+# new projects need no code change; aliases are just convenience. "bus" resolves
+# at runtime because the project folder is named differently on dev vs server.
+ENV_TARGET_ALIASES = {
+    "transcriber": "Constan_transcriber_telegram_bot",
+}
+
+
+def _is_admin(update):
+    """Numeric-ID admin gate. Fails closed when Config.ADMIN_IDS is empty (no env)."""
+    user = update.effective_user
+    return bool(user) and user.id in Config.ADMIN_IDS
+
+
+def _store_b2_key(key_id, app_key):
+    """Atomically persist the B2 application key where cloud_sync expects it."""
+    key_path = Config.B2_KEY_PATH
+    os.makedirs(os.path.dirname(key_path), exist_ok=True)
+    part_path = key_path + ".part"
+    with open(part_path, "w", encoding="utf-8") as f:
+        json.dump({"keyID": key_id, "applicationKey": app_key}, f)
+    os.replace(part_path, key_path)
+
+
+async def document_upload_handler(update, context):
+    """Route admin document uploads: .env -> project env delivery, .json -> B2 key.
+    Non-admins get silence (public bot)."""
+    if not _is_admin(update):
+        return
+    doc = update.message.document if update.message else None
+    if doc is None:
+        return
+
+    name = (doc.file_name or "").lower()
+    if name.endswith(".env"):
+        await _env_upload(update, context, doc)
+    elif name.endswith(".json"):
+        await _b2_key_upload(update, context, doc)
+    else:
+        await update.message.reply_text(
+            "Unsupported file. Send a project .env (caption = project folder or alias) "
+            "or a B2 application key as .json."
+        )
+
+
+async def _env_upload(update, context, doc):
+    """Write a DM'd .env into a sibling project's folder. The target comes from the
+    message caption, or from the filename stem (e.g. transcriber.env). The previous
+    .env (if any) is kept as .env.bak. The file only takes effect when that project
+    is restarted via the Admin Hub."""
+    msg = update.message
+    caption = (msg.caption or "").strip()
+    fname = doc.file_name or ""
+    stem = fname[:-4].strip() if fname.lower().endswith(".env") else ""
+    target = caption or stem
+    if not target:
+        await msg.reply_text(
+            "Which project is this .env for? Add the project folder name (or an alias "
+            "like 'transcriber') as the file caption, or name the file e.g. transcriber.env."
+        )
+        return
+
+    folder_name = ENV_TARGET_ALIASES.get(target.lower(), target)
+    if target.lower() == "bus":
+        folder_name = os.path.basename(Config.BASE_DIR)
+    # Strict charset = no path traversal (no slashes, dots, drive letters).
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", folder_name):
+        await msg.reply_text(f"Rejected: '{folder_name}' is not a valid project folder name.")
+        return
+
+    projects_root = os.path.dirname(Config.BASE_DIR)
+    target_dir = os.path.join(projects_root, folder_name)
+    if not os.path.isdir(target_dir):
+        await msg.reply_text(f"Rejected: no sibling project folder named '{folder_name}'.")
+        return
+
+    # .env files are tiny; 64 KB is already generous.
+    if doc.file_size and doc.file_size > 64 * 1024:
+        await msg.reply_text("Rejected: file too large to be a .env (>64 KB).")
+        return
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        await msg.reply_text(f"Download failed: {e}")
+        return
+
+    # Sanity: non-empty, decodable, and contains at least one KEY=value line
+    # (guards against the historical 0-byte .env incident).
+    try:
+        text = data.decode("utf-8-sig")
+    except Exception:
+        await msg.reply_text("Rejected: file is not readable text.")
+        return
+    if not re.search(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", text, re.MULTILINE):
+        await msg.reply_text("Rejected: no KEY=value lines found - that does not look like a .env.")
+        return
+
+    dest = os.path.join(target_dir, ".env")
+    backed_up = False
+    try:
+        if os.path.exists(dest):
+            shutil.copy2(dest, dest + ".bak")
+            backed_up = True
+        part_path = dest + ".part"
+        with open(part_path, "wb") as f:
+            f.write(data)
+        os.replace(part_path, dest)
+    except Exception as e:
+        await msg.reply_text(f"Failed to write .env: {e}")
+        return
+
+    note = " (previous .env saved as .env.bak)" if backed_up else ""
+    await msg.reply_text(
+        f"Wrote {len(data)} bytes to {folder_name}/.env{note}.\n"
+        f"Restart that project via the Admin Hub to apply it."
+    )
+
+
+async def _b2_key_upload(update, context, doc):
+    """Bootstrap: receive the B2 application key as a small .json DM'd by an admin
+    and store it gitignored at Config.B2_KEY_PATH. Order of checks: admin (done by
+    router) -> size -> valid key JSON -> persist atomically."""
+    # The key json is tiny; cap at 20 KB.
+    if doc.file_size and doc.file_size > 20 * 1024:
+        await update.message.reply_text("Rejected: file too large to be a B2 key (>20 KB).")
+        return
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        data = bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        await update.message.reply_text(f"Download failed: {e}")
+        return
+
+    try:
+        parsed = json.loads(data.decode("utf-8-sig"))
+    except Exception:
+        await update.message.reply_text("Rejected: not valid JSON.")
+        return
+    if not isinstance(parsed, dict):
+        await update.message.reply_text("Rejected: expected a JSON object.")
+        return
+    key_id = parsed.get("keyID") or parsed.get("applicationKeyId") or parsed.get("key_id")
+    app_key = parsed.get("applicationKey") or parsed.get("application_key") or parsed.get("appKey")
+    if not (isinstance(key_id, str) and key_id and isinstance(app_key, str) and app_key):
+        await update.message.reply_text(
+            'Rejected: not a B2 key (need {"keyID": "...", "applicationKey": "..."}).'
+        )
+        return
+
+    try:
+        _store_b2_key(key_id, app_key)
+    except Exception as e:
+        await update.message.reply_text(f"Failed to store key: {e}")
+        return
+
+    await update.message.reply_text("B2 application key stored - cloud transfer layer armed.")
+
+
+async def cmd_armb2(update, context):
+    """Arm the cloud layer from a command: /armb2 <keyID> <applicationKey>.
+    The message containing the secret is deleted from the chat after storing."""
+    if not _is_admin(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /armb2 <keyID> <applicationKey>")
+        return
+    try:
+        _store_b2_key(context.args[0], context.args[1])
+    except Exception as e:
+        await update.message.reply_text(f"Failed to store key: {e}")
+        return
+    try:
+        await update.message.delete()  # scrub the key from the chat history
+    except Exception:
+        pass
+    await update.effective_chat.send_message(
+        "B2 application key stored - cloud transfer layer armed. "
+        "(Your message was deleted to scrub the key.)"
+    )
+
+
+async def cmd_pushdb(update, context):
+    """On-demand DB backup: snapshot the live SQLite DB and upload it to B2."""
+    if not _is_admin(update):
+        return
+    import cloud_sync
+    if not cloud_sync.is_configured():
+        await update.message.reply_text("Cloud layer not armed yet (missing B2 key).")
+        return
+    await update.message.reply_text("Backing up DB to cloud storage...")
+    db_path = os.path.join(Config.BASE_DIR, "data", "bus_data.db")
+    # Run off the event loop so a multi-MB upload doesn't freeze the poller.
+    result = await asyncio.to_thread(cloud_sync.push_db_backup, db_path)
+    if result:
+        await update.message.reply_text(f"DB backup uploaded: {result}")
+    else:
+        await update.message.reply_text("DB backup failed (see server logs).")
+
+
+async def cmd_pull(update, context):
+    """On-demand model deploy: download a B2 object into src/models/ (restores the
+    lost /upload_model). Usage: /pull <object_name>."""
+    if not _is_admin(update):
+        return
+    import cloud_sync
+    if not cloud_sync.is_configured():
+        await update.message.reply_text("Cloud layer not armed yet (missing B2 key).")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /pull <object_name>  (downloads into src/models/)")
+        return
+
+    object_name = context.args[0]
+    # basename() keeps the write inside src/models/ regardless of the object path.
+    dest = os.path.join(Config.BASE_DIR, "src", "models", os.path.basename(object_name))
+    await update.message.reply_text(f"Pulling {object_name}...")
+    ok = await asyncio.to_thread(cloud_sync.pull, object_name, dest)
+    if ok:
+        await update.message.reply_text(f"Downloaded to src/models/{os.path.basename(object_name)}")
+    else:
+        await update.message.reply_text("Pull failed (see server logs).")
+
+
 def start_bot():
     from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
     import logging
+    import socket
     logging.basicConfig(level=logging.INFO)
     # httpx logs every Telegram API request at INFO - including the bot token
     # in the URL. Keep it out of the persistent log file.
@@ -290,11 +533,30 @@ def start_bot():
     if not token:
         print("Error: TELEGRAM_BOT_TOKEN not found in environment. Please add it to your .env file.")
         return
-        
+
+    # One token = one poller. A second instance would otherwise steal the token and
+    # leave both deaf to a silent HTTP 409. Bind a localhost port for the process
+    # lifetime; if it's already taken, another poller is live -> bail out. The OS
+    # releases the port automatically when this process dies (no lock file to clean).
+    global _SINGLE_INSTANCE_LOCK
+    _SINGLE_INSTANCE_LOCK = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _SINGLE_INSTANCE_LOCK.bind(("127.0.0.1", 47615))
+    except OSError:
+        print("Error: another ETA bot instance is already running (single-instance guard). Exiting.")
+        return
+
     print("Starting Telegram Bot...")
     app = ApplicationBuilder().token(token).build()
+    # Admin-gated handlers MUST be registered before the catch-all: python-telegram-bot
+    # runs only the first matching handler per group, so the catch-all would otherwise
+    # swallow /pushdb, /pull, /armb2, and document uploads.
+    app.add_handler(MessageHandler(filters.Document.ALL, document_upload_handler))
+    app.add_handler(CommandHandler("pushdb", cmd_pushdb))
+    app.add_handler(CommandHandler("pull", cmd_pull))
+    app.add_handler(CommandHandler("armb2", cmd_armb2))
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, bot_handler))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     import argparse

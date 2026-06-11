@@ -28,6 +28,21 @@ class Config:
     # Database
     DATABASE_URL = os.getenv("DATABASE_URL")
 
+    # Admin authorization: numeric Telegram user IDs (unforgeable, NOT secrets).
+    # Parsed from the bus bot's own ADMIN_TELEGRAM_ID, which already ships on the
+    # server, so admin-gated handlers work with zero bootstrap. Gate on these IDs,
+    # never on the spoofable username. Empty set => fail closed (no admin).
+    ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_TELEGRAM_ID", "").split(",") if x.strip().isdigit()}
+
+    # Backblaze B2 transfer layer (see src/cloud_sync.py).
+    # The bucket NAME is not a secret (the bucket itself is private), so it ships
+    # as a committed default to avoid editing env on the server; the B2_BUCKET env
+    # var still overrides. Must match the real bucket created in the B2 console.
+    # The application KEY is the only secret; it arrives out-of-band via Telegram
+    # (DM a .json or /armb2) and is stored gitignored at B2_KEY_PATH (never git).
+    B2_BUCKET = os.getenv("B2_BUCKET", "cyprus-bus-bot")
+    B2_KEY_PATH = os.getenv("B2_KEY_PATH", os.path.join(BASE_DIR, "secrets", "b2_key.json"))
+
     @classmethod
     def ensure_directories(cls):
         os.makedirs(cls.STATIC_DATA_DIR, exist_ok=True)

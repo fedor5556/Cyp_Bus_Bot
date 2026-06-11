@@ -10,6 +10,8 @@ from ingestion.fetch_static import download_static_gtfs
 from ingestion.fetch_weather import get_current_weather
 from analysis.geofence import check_geofence
 from db.models import get_session, WeatherRecord
+from config import Config
+import cloud_sync
 
 def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
     print("==================================================")
@@ -25,8 +27,10 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Performing initial schedule check...")
     download_static_gtfs()
     last_schedule_update = datetime.now()
-    
+
     last_weather_update = datetime.min # Force immediate weather update
+    last_db_backup = datetime.min # Push a DB backup early, then every 12h
+    last_env_pull = datetime.min # Retry transcriber .env delivery every 10 min
     
     try:
         while True:
@@ -56,6 +60,39 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
                     session.close()
                     print(f"[{current_time}] Weather logged: {weather_data['temperature_c']}°C, Raining: {weather_data['is_raining']}")
                 last_weather_update = datetime.now()
+
+            # 0c. Push a DB backup to cloud storage every 12h (and once shortly
+            # after the layer is armed). No-op while unarmed; last_db_backup only
+            # advances on a successful push, so arming triggers a prompt backup.
+            if datetime.now() - last_db_backup > timedelta(hours=12):
+                try:
+                    if cloud_sync.is_configured():
+                        db_path = os.path.join(Config.BASE_DIR, "data", "bus_data.db")
+                        result = cloud_sync.push_db_backup(db_path)
+                        if result:
+                            print(f"[{current_time}] DB backup pushed to cloud: {result}")
+                            last_db_backup = datetime.now()
+                except Exception as e:
+                    print(f"Cloud DB backup skipped: {e}")
+
+            # 0d. Deliver the Voice Transcriber's .env from cloud storage if it is
+            # not on this machine yet. Retries every 10 min (so it works no matter
+            # when the layer is armed or the object is uploaded) and stops touching
+            # the network once the file exists - its existence is the sentinel.
+            # The primary delivery path is now a Telegram DM to the bot; this is
+            # the fallback for when that is forgotten.
+            if datetime.now() - last_env_pull > timedelta(minutes=10):
+                last_env_pull = datetime.now()
+                try:
+                    sibling = os.path.join(os.path.dirname(Config.BASE_DIR), "Constan_transcriber_telegram_bot")
+                    transcriber_env = os.path.join(sibling, ".env")
+                    if (cloud_sync.is_configured() and os.path.isdir(sibling)
+                            and not os.path.exists(transcriber_env)):
+                        if cloud_sync.pull("transcriber/.env", transcriber_env,
+                                           validate_contains="PUBLIC_BOT_TOKEN", no_clobber=True):
+                            print(f"[{current_time}] Transcriber .env delivered from cloud storage.")
+                except Exception as e:
+                    print(f"Cloud transcriber .env pull skipped: {e}")
 
             # 1. Fetch Live Data quietly
             fetch_realtime_data(quiet=True)

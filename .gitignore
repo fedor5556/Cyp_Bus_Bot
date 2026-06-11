@@ -1,5 +1,6 @@
 # Environment variables / Secrets
 .env
+.env.bak
 
 # Database and raw data
 data/*.db
@@ -39,6 +40,19 @@ setup/server_data/
 # ML model artifacts (large binary files)
 src/models/*.pkl
 src/models/*.joblib
+src/models/*.json
+
+# Cloud storage application key (the ONLY secret in the cloud layer) + DB
+# backup snapshots created by cloud_sync.push_db_backup. NEVER commit these.
+secrets/
+b2_key.json
+data/*.bak
 
 # Scratch files
 scratch_*.py
+
+# Internal planning / history / architecture notes - NEVER publish to the public repo
+CLAUDE_HISTORY.md
+CLAUDEv1.md
+CLAUDE_v2.md
+remote_host_architecture_guideLAST.md
