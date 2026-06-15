@@ -7,6 +7,48 @@ from datetime import datetime, timedelta
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
 
+# --- mtime-cached stop_times index ------------------------------------------
+# stop_times.txt is ~6.4 MB. Multi-stop capture (geofence.py) needs the schedule
+# for every stop on a trip on every monitor cycle, so re-reading the CSV per
+# lookup is wasteful. We load it once into a {trip_id: {stop_id: arrival_str}}
+# index and rebuild only when the file's mtime changes (so the 12 h GTFS
+# auto-update is picked up). Mirrors the caching strategy in map_matching.py.
+_st_cache = {"mtime": None, "by_trip": None}
+
+
+def _stop_times_path():
+    return os.path.join(Config.STATIC_DATA_DIR, 'Limassol', 'stop_times.txt')
+
+
+def _load_stop_times():
+    """Return the {trip_id: {stop_id: arrival_time_str}} index, or None if the
+    file is missing. Cached and invalidated on the file's mtime."""
+    path = _stop_times_path()
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if _st_cache["mtime"] == mtime and _st_cache["by_trip"] is not None:
+        return _st_cache["by_trip"]
+
+    df = pd.read_csv(path, usecols=['trip_id', 'arrival_time', 'stop_id'], dtype=str)
+    by_trip = {}
+    for r in df.itertuples(index=False):
+        by_trip.setdefault(r.trip_id, {})[r.stop_id] = r.arrival_time
+    _st_cache["mtime"] = mtime
+    _st_cache["by_trip"] = by_trip
+    return by_trip
+
+
+def _parse_gtfs_time(time_str, date):
+    """Parse a GTFS HH:MM:SS arrival string into a datetime on `date`. GTFS times
+    can exceed 24:00:00 (e.g. 25:30:00 = 01:30 the next day); timedelta rolls the
+    overflow into the following day automatically."""
+    hours, minutes, seconds = map(int, time_str.split(':'))
+    base_date = date.replace(hour=0, minute=0, second=0, microsecond=0)
+    return base_date + timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+
 def get_scheduled_arrival(trip_id: str, stop_id: str, date: datetime = None):
     """
     Looks up the exact scheduled arrival time for a specific trip at a specific stop.
@@ -14,32 +56,48 @@ def get_scheduled_arrival(trip_id: str, stop_id: str, date: datetime = None):
     """
     if date is None:
         date = datetime.now()
-        
-    # We load the static stop_times.txt for Limassol
-    stop_times_path = os.path.join(Config.STATIC_DATA_DIR, 'Limassol', 'stop_times.txt')
-    
-    if not os.path.exists(stop_times_path):
-        print(f"Error: Could not find static schedule at {stop_times_path}")
+
+    by_trip = _load_stop_times()
+    if by_trip is None:
+        print(f"Error: Could not find static schedule at {_stop_times_path()}")
         return None
 
-    # Load only the necessary columns to save memory
-    df = pd.read_csv(stop_times_path, usecols=['trip_id', 'arrival_time', 'stop_id'], dtype=str)
-    
-    # Filter for the exact trip and stop
-    match = df[(df['trip_id'] == trip_id) & (df['stop_id'] == stop_id)]
-    
-    if match.empty:
+    trip = by_trip.get(str(trip_id))
+    if not trip:
         return None
-        
-    time_str = match.iloc[0]['arrival_time']
-    
-    # GTFS times can be > 24:00:00 (e.g., 25:30:00 means 01:30 AM the next day)
-    hours, minutes, seconds = map(int, time_str.split(':'))
-    
-    base_date = date.replace(hour=0, minute=0, second=0, microsecond=0)
-    scheduled_datetime = base_date + timedelta(hours=hours, minutes=minutes, seconds=seconds)
-    
-    return scheduled_datetime
+    time_str = trip.get(str(stop_id))
+    if time_str is None:
+        return None
+
+    try:
+        return _parse_gtfs_time(time_str, date)
+    except (ValueError, AttributeError):
+        return None
+
+
+def get_scheduled_arrivals_for_trip(trip_id: str, date: datetime = None):
+    """Return {stop_id: scheduled_datetime} for EVERY stop on a trip in one shot.
+
+    Used by multi-stop arrival capture so a single cached lookup covers all of a
+    trip's ~40 stops instead of one CSV scan per stop. Returns {} if the trip is
+    unknown or the schedule file is missing."""
+    if date is None:
+        date = datetime.now()
+
+    by_trip = _load_stop_times()
+    if not by_trip:
+        return {}
+    trip = by_trip.get(str(trip_id))
+    if not trip:
+        return {}
+
+    out = {}
+    for stop_id, time_str in trip.items():
+        try:
+            out[stop_id] = _parse_gtfs_time(time_str, date)
+        except (ValueError, AttributeError):
+            continue
+    return out
 
 def get_next_scheduled_arrival(route_id: str, stop_id: str, current_time: datetime = None):
     """

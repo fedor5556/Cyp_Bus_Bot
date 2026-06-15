@@ -9,7 +9,7 @@ from ingestion.fetch_rt import fetch_realtime_data
 from ingestion.fetch_static import download_static_gtfs
 from ingestion.fetch_weather import get_current_weather
 from analysis.geofence import check_geofence
-from db.models import get_session, WeatherRecord
+from db.models import get_session, migrate_db, WeatherRecord
 from config import Config
 import cloud_sync
 
@@ -23,6 +23,15 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
     print("Press Ctrl+C to stop.")
     print("==================================================")
     
+    # Apply any pending schema migrations BEFORE the loop (adds multi-stop
+    # capture columns + the (trip_id, stop_id) unique index). Idempotent; run
+    # under PRAGMA busy_timeout so it waits out the ETA bot's concurrent writes.
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Running database migrations...")
+    try:
+        migrate_db()
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] migrate_db failed: {e}")
+
     # Run an initial schedule update on startup
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Performing initial schedule check...")
     download_static_gtfs()
@@ -96,10 +105,15 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
 
             # 1. Fetch Live Data quietly
             fetch_realtime_data(quiet=True)
-            
-            # 2. Check the Geofence and Calculate Delays
-            check_geofence(quiet=False)
-            
+
+            # 2. Check stop crossings and Calculate Delays. Isolated so one bad
+            # stop / projection in the heavier multi-stop pass can't crash the
+            # whole monitor loop.
+            try:
+                check_geofence(quiet=False)
+            except Exception as e:
+                print(f"[{current_time}] check_geofence error (continuing): {e}")
+
             # 3. Wait 10 seconds (as defined by interval_seconds)
             time.sleep(interval_seconds)
             

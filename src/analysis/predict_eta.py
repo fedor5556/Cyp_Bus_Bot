@@ -12,6 +12,7 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.models import VehiclePosition, get_session
 from analysis.geofence import haversine, STOP_LAT, STOP_LON, RADIUS_METERS
+from analysis import map_matching as mm
 from config import Config
 
 # Target stops based on direction
@@ -168,7 +169,24 @@ def get_prediction_text():
         sma_speed_kmh = sma_speed_mps * 3.6
 
         estimated_movement = sma_speed_mps * extrapolate_time
-        raw_distance = haversine(STOP_LAT, STOP_LON, pos.latitude, pos.longitude)
+
+        # Distance to this direction's target stop measured ALONG THE ROUTE
+        # (map-matching). The old straight-line haversine systematically
+        # understated the distance (median ~1.2 km on real Route 90 pings, up to
+        # ~11 km), always making the bus look closer than it is. Fall back to
+        # straight-line only when the bus is off-route or the shape is missing,
+        # so the bot can never break.
+        target_stop_id = TARGET_STOPS.get(pos.route_id)
+        route_dist = (mm.route_distance_to_stop(pos.route_id, pos.latitude, pos.longitude, target_stop_id)
+                      if target_stop_id else {"ok": False})
+        if route_dist.get("ok") and route_dist.get("on_route"):
+            raw_distance = route_dist["abs_distance_m"]
+            passed_by_route = route_dist["passed"]
+            dist_tag = ""
+        else:
+            raw_distance = haversine(STOP_LAT, STOP_LON, pos.latitude, pos.longitude)
+            passed_by_route = None
+            dist_tag = " [straight-line]"
         smooth_distance = max(0, raw_distance - estimated_movement)
 
         direction = "Towards Lemesos" if pos.route_id == "10900011" else "Towards Sanida"
@@ -186,9 +204,11 @@ def get_prediction_text():
             output.append("-" * 50)
             continue
 
-        # 1. ALREADY PASSED CHECK
-        if target_seq != -1 and current_seq > target_seq:
-            output.append(f"  Distance to Pyrgos Church: {smooth_distance/1000:.1f} km (Speed: {sma_speed_kmh:.1f} km/h)")
+        # 1. ALREADY PASSED CHECK (prefer along-route position; fall back to the
+        # schedule stop-sequence when off-route / no shape available)
+        has_passed = passed_by_route if passed_by_route is not None else (target_seq != -1 and current_seq > target_seq)
+        if has_passed:
+            output.append(f"  Distance to Pyrgos Church: {smooth_distance/1000:.1f} km (Speed: {sma_speed_kmh:.1f} km/h){dist_tag}")
             output.append(f"  Status: Passed Pyrgos on current trip (At or heading to terminal)")
             
             # Provide movement-based ETA for the return trip
@@ -202,8 +222,8 @@ def get_prediction_text():
             output.append("-" * 50)
             continue
             
-        output.append(f"  Distance to Pyrgos Church: {smooth_distance/1000:.1f} km (Speed: {sma_speed_kmh:.1f} km/h)")
-        
+        output.append(f"  Distance to Pyrgos Church: {smooth_distance/1000:.1f} km (Speed: {sma_speed_kmh:.1f} km/h){dist_tag}")
+
         if target_sched:
             delay_min = delay_sec / 60
             
