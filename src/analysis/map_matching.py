@@ -159,6 +159,18 @@ def shape_for_route(route_id):
     return _cache["route_shape"].get(str(route_id))
 
 
+def stop_coordinates(stop_id):
+    """(lat, lon) for a stop_id straight from stops.txt, or None if unknown.
+
+    Public accessor over the cached stop_coords table (mtime-invalidated via
+    _ensure_loaded) so callers don't reach into the private _cache. Used by the
+    straight-line ETA fallback to measure to the *correct* target stop per
+    direction instead of one hard-coded church-side coordinate.
+    """
+    _ensure_loaded()
+    return _cache["stop_coords"].get(str(stop_id))
+
+
 def _to_local(lat, lon, lat0, lon0):
     """Equirectangular meters of (lat,lon) relative to (lat0,lon0)."""
     mlat = 110574.0

@@ -9,6 +9,7 @@ from ingestion.fetch_rt import fetch_realtime_data
 from ingestion.fetch_static import download_static_gtfs
 from ingestion.fetch_weather import get_current_weather
 from analysis.geofence import check_geofence
+from analysis import eta
 from db.models import get_session, migrate_db, WeatherRecord
 from config import Config
 import cloud_sync
@@ -40,6 +41,7 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
     last_weather_update = datetime.min # Force immediate weather update
     last_db_backup = datetime.min # Push a DB backup early, then every 12h
     last_env_pull = datetime.min # Retry transcriber .env delivery every 10 min
+    last_prediction_log = datetime.min # Snapshot ETA predictions every 60s (drift dataset)
     
     try:
         while True:
@@ -113,6 +115,22 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
                 check_geofence(quiet=False)
             except Exception as e:
                 print(f"[{current_time}] check_geofence error (continuing): {e}")
+
+            # 2b. Snapshot the bot's own forward ETAs every 60s (PredictionLog /
+            # drift dataset). Reuses the pings just fetched - no extra GTFS-RT call.
+            # Same robustness rule as geofence: a bad prediction can't crash the loop.
+            if datetime.now() - last_prediction_log > timedelta(seconds=60):
+                last_prediction_log = datetime.now()
+                try:
+                    pred_session = get_session()
+                    try:
+                        n = eta.log_predictions(pred_session)
+                    finally:
+                        pred_session.close()
+                    if n:
+                        print(f"[{current_time}] Logged {n} ETA prediction(s).")
+                except Exception as e:
+                    print(f"[{current_time}] log_predictions error (continuing): {e}")
 
             # 3. Wait 10 seconds (as defined by interval_seconds)
             time.sleep(interval_seconds)

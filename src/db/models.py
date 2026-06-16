@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Index, inspect, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, Index, inspect, text, event
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import os
@@ -90,14 +90,105 @@ class TripSummary(Base):
     terminal_departure_delay_seconds = Column(Integer, nullable=True)
     recorded_at = Column(DateTime, default=datetime.utcnow)
 
-def get_engine():
+class PredictionLog(Base):
+    """Snapshots the bot's own forward ETA to a direction's target stop (Phase 3,
+    step 2). One row per active bus per logging tick (~60 s) while it has a genuine
+    forward prediction. Joined later to StopEvent on (trip_id, stop_id) to measure
+    prediction *drift* (error vs lead time) and calibrate prediction intervals.
+
+    The values are produced by the SAME analysis.eta.compute_vehicle_prediction the
+    ETA bot formats, so what we log is provably what the bot showed.
+    """
+    __tablename__ = 'prediction_logs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    vehicle_id = Column(String, index=True)
+    trip_id = Column(String, index=True)
+    route_id = Column(String, index=True)
+    stop_id = Column(String, index=True)             # the direction's target stop
+    predicted_at = Column(DateTime, index=True)      # the 'now' the prediction was made at
+    predicted_arrival = Column(DateTime)             # the forecast arrival time
+    lead_time_min = Column(Float)                    # (predicted_arrival - predicted_at)/60
+    eta_source = Column(String, nullable=True)       # 'schedule' | 'move' | 'hybrid'
+    distance_m = Column(Float, nullable=True)        # smoothed along-route distance to stop
+    speed_kmh = Column(Float, nullable=True)
+    delay_seconds = Column(Integer, nullable=True)   # schedule delay at the closest stop, if known
+    is_stationary = Column(Boolean, default=False)
+    is_stale = Column(Boolean, default=False)
+    on_route = Column(Boolean, default=False)        # bus snapped within the off-route threshold
+    # CLOCK CAUTION: recorded_at is UTC (datetime.utcnow, the repo-wide convention
+    # for row-insert metadata), but predicted_at / predicted_arrival above are LOCAL
+    # (datetime.now() == EEST on the server) because they must line up with StopEvent's
+    # local arrival times for the drift join. So the two timestamps in one row are
+    # ~3 h apart by design. Analyse drift on predicted_at/predicted_arrival ONLY; never
+    # bucket or filter on recorded_at as a proxy for prediction time.
+    recorded_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('ix_predlog_trip_stop', 'trip_id', 'stop_id'),
+    )
+
+# Process-wide singleton Engine (built lazily, reused for the process lifetime).
+_ENGINE = None
+
+
+def _build_engine():
     db_url = Config.DATABASE_URL
     if not db_url or "user:password" in db_url:
         db_path = os.path.join(Config.BASE_DIR, 'data', 'bus_data.db')
         db_url = f"sqlite:///{db_path}"
-    
+
     engine = create_engine(db_url, echo=False)
+
+    if engine.dialect.name == "sqlite":
+        # Apply the SQLite hardening PRAGMAs to EVERY runtime connection, not just
+        # migrate_db's one-off. monitor.py and the ETA bot are two separate
+        # processes writing the same bus_data.db file.
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
+            cur = dbapi_conn.cursor()
+            try:
+                # busy_timeout is per-connection and never needs a lock -> set it
+                # first. Wait up to 30 s for a concurrent writer instead of raising
+                # 'database is locked' the instant two writes collide.
+                cur.execute("PRAGMA busy_timeout=30000")
+                # WAL: readers never block the writer and the writer doesn't block
+                # readers, so the two processes collide far less. WAL is a persistent
+                # property of the file (set once, stays set across reopens).
+                #
+                # CAUTION: the ONE-TIME DELETE->WAL conversion needs a brief exclusive
+                # lock and does NOT honor busy_timeout -- it raises 'database is locked'
+                # *immediately* if the other process (monitor vs bot) holds a write lock
+                # at that instant. Swallow that so a startup race can't crash the
+                # connection: it proceeds in the file's current (DELETE) mode with
+                # busy_timeout still in force, and the next connection that finds the
+                # file unlocked performs the conversion. On an already-WAL file this
+                # PRAGMA is a no-op that succeeds even under a held write lock, so once
+                # converted the race can never recur.
+                try:
+                    cur.execute("PRAGMA journal_mode=WAL")
+                except Exception:
+                    pass
+            finally:
+                cur.close()
+
     return engine
+
+
+def get_engine():
+    """Return the process-wide singleton Engine, building it on first use.
+
+    Previously this constructed a NEW Engine (and connection pool) on every call,
+    and get_session() calls it on every monitor tick (10 s) and every bot query --
+    so each tick spun up and tore down a pool/file handle against bus_data.db. An
+    Engine is meant to be a long-lived per-process singleton: build once, reuse.
+    The connect listener in _build_engine also guarantees busy_timeout + WAL apply
+    to the RUNTIME path, which finding #1 noted only migrate_db set before.
+    """
+    global _ENGINE
+    if _ENGINE is None:
+        _ENGINE = _build_engine()
+    return _ENGINE
 
 def init_db():
     engine = get_engine()

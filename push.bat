@@ -12,27 +12,20 @@ echo [INFO] Changed files:
 git status --short
 echo.
 
-:: Check if there are any changes
-git diff --quiet --cached 2>nul
-git diff --quiet 2>nul
-git status --porcelain | findstr /r "." >nul 2>nul
-if errorlevel 1 (
-    echo [INFO] No changes to commit. Everything is up to date.
-    echo.
-    pause
-    exit /b 0
-)
-
-:: Stage all changes
+:: Stage everything first so we can tell if there is anything new to commit.
 git add .
-echo [OK] All changes staged.
-echo.
 
-:: Prompt for commit message
+:: If there are staged changes, commit them. If not, SKIP the commit but still
+:: push - there may be commits made earlier (e.g. from a tool) that were never
+:: pushed. The old version exited here on a clean tree and never pushed those.
+git diff --cached --quiet
+if errorlevel 1 goto commit
+echo [INFO] Nothing new to commit - checking for unpushed commits...
+goto push
+
+:commit
 set /p MSG="Commit message (or press Enter for 'Update'): "
 if "%MSG%"=="" set MSG=Update
-
-:: Commit
 git commit -m "%MSG%"
 if errorlevel 1 (
     echo.
@@ -40,7 +33,9 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+echo [OK] Changes committed.
 
+:push
 echo.
 echo [INFO] Pushing to origin/main...
 git push origin main
@@ -53,7 +48,7 @@ if errorlevel 1 (
 
 echo.
 echo ==================================================
-echo  [SUCCESS] Code pushed to GitHub!
+echo  [SUCCESS] Repo is up to date on GitHub!
 echo  Now send /update to the Admin Bot on Telegram
 echo  to deploy it to the server.
 echo ==================================================
