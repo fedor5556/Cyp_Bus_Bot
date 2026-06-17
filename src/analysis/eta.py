@@ -11,7 +11,12 @@ So the calculation lives here and returns a structured VehiclePrediction (no tex
 Two consumers call it:
   * the bot (predict_eta.format_prediction) wraps it back into the exact same lines;
   * the logger (monitor.py via log_predictions) writes it into PredictionLog.
-One computation, two consumers -> what we log is provably what the bot showed.
+One computation, two consumers -> for any SINGLE shared invocation (same session and
+same `now`) the logged row and the bot's text are the same computation. Caveat: the
+live bot and the logger invoke compute_vehicle_prediction *separately* - the bot does
+its own reactive GTFS-RT fetch and uses a fresh datetime.now() per query, the logger
+uses the monitor tick's `now` over the pings already in the DB - so a logged row is not
+literally the render any user saw, only the identical math applied to each side's inputs.
 
 `now` is injectable everywhere so tests are deterministic and the bot + logger can
 share ONE reference time per tick (the whole point - otherwise the logged arrival
@@ -24,14 +29,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
-import pandas as pd
-
 # Add parent directory to path so we can import config and models
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.models import VehiclePosition, PredictionLog
 from analysis.geofence import haversine, STOP_LAT, STOP_LON, RADIUS_METERS
 from analysis import map_matching as mm
-from config import Config
+from analysis import schedule
 
 # Route 90 directions (stable route_ids; trip_ids rotate every GTFS pull).
 ROUTE_IDS = ["10900011", "10900012"]
@@ -71,65 +74,57 @@ def calculate_sma_speed(session, vehicle_id, current_pos, num_pings=10):
 
 def get_trip_state(trip_id, pos):
     """
-    Finds the closest stop to the ping, calculates delay, and returns the stop sequence.
+    Find the closest stop to the ping, calculate the schedule delay there, and
+    return the target stop's sequence + scheduled arrival.
     Returns: (delay_sec, current_sequence, target_sequence, target_scheduled_dt)
+
+    Steady-state this touches NO files. The per-trip scheduled arrivals come from
+    schedule.get_scheduled_arrivals_for_trip (an mtime-cached {stop_id: datetime}
+    index) and the stop coordinates + sequences from map_matching.ordered_stops_for_route
+    (also mtime-cached). Previously this re-parsed the 6.4 MB stop_times.txt AND
+    stops.txt with pandas, merged them, and ran a per-stop haversine on EVERY vehicle
+    on EVERY tick (and every bot query) -- the heaviest hot-path cost in the module.
+    Both cache layers fail soft ({} / []), reproducing the old missing-file behaviour.
     """
-    stop_times_path = os.path.join(Config.STATIC_DATA_DIR, 'Limassol', 'stop_times.txt')
-    stops_path = os.path.join(Config.STATIC_DATA_DIR, 'Limassol', 'stops.txt')
-
-    if not os.path.exists(stop_times_path) or not os.path.exists(stops_path):
-        return 0, -1, -1, None
-
-    # Load trip schedule
-    st_df = pd.read_csv(stop_times_path, usecols=['trip_id', 'arrival_time', 'stop_id', 'stop_sequence'], dtype=str)
-    trip_df = st_df[st_df['trip_id'] == trip_id].copy()
-    if trip_df.empty:
-        return 0, -1, -1, None
-    trip_df['stop_sequence'] = trip_df['stop_sequence'].astype(int)
-
-    # Identify target stop sequence and schedule for this specific trip
     target_stop_id = TARGET_STOPS.get(pos.route_id)
     if not target_stop_id:
         return 0, -1, -1, None
 
-    target_row = trip_df[trip_df['stop_id'] == target_stop_id]
-    if target_row.empty:
+    # This trip's scheduled arrivals {stop_id: datetime}. Anchored to the ping's own
+    # date inside the helper, matching the old base_date = pos.timestamp logic.
+    arrivals = schedule.get_scheduled_arrivals_for_trip(trip_id, date=pos.timestamp)
+    target_scheduled_dt = arrivals.get(target_stop_id) if arrivals else None
+    if target_scheduled_dt is None:
+        # Trip unknown to the schedule, or the target stop isn't on this trip
+        # (also covers a missing stop_times.txt -> arrivals == {}).
         return 0, -1, -1, None
 
-    target_seq = target_row.iloc[0]['stop_sequence']
-    target_time_str = target_row.iloc[0]['arrival_time']
+    # Ordered, shape-snapped stops for this direction (cached coords + sequences).
+    ordered = mm.ordered_stops_for_route(pos.route_id)
+    if not ordered:
+        # Schedule known but no geometry to locate the closest stop (e.g. a GTFS
+        # integrity gap right after a refresh, or a missing stops.txt). Keep the
+        # schedule-backed prediction; just skip the closest-stop delay.
+        return 0, -1, -1, target_scheduled_dt
 
-    # Base date logic for time parsing
-    base_date = pos.timestamp.replace(hour=0, minute=0, second=0, microsecond=0)
+    target_seq = -1
+    closest = None
+    closest_dist = None
+    for s in ordered:
+        if s["stop_id"] == target_stop_id:
+            target_seq = s["stop_sequence"]
+        d = haversine(pos.latitude, pos.longitude, s["lat"], s["lon"])
+        if closest_dist is None or d < closest_dist:
+            closest_dist = d
+            closest = s
 
-    def parse_time(t_str):
-        h, m, s = map(int, t_str.split(':'))
-        return base_date + timedelta(hours=h, minutes=m, seconds=s)
-
-    target_scheduled_dt = parse_time(target_time_str)
-
-    # Load stops to find closest
-    stops_df = pd.read_csv(stops_path, usecols=['stop_id', 'stop_lat', 'stop_lon'], dtype=str)
-    merged = pd.merge(trip_df, stops_df, on='stop_id')
-    if merged.empty:
-        # None of this trip's stop_ids resolved to coordinates in stops.txt (a GTFS
-        # integrity gap that can appear right after a schedule refresh). idxmin() on
-        # the empty result would raise ValueError, aborting the whole compute. We
-        # still have the target stop's schedule, so keep the schedule-backed
-        # prediction alive and just skip the closest-stop delay calculation.
-        return 0, -1, target_seq, target_scheduled_dt
-    merged['stop_lat'] = merged['stop_lat'].astype(float)
-    merged['stop_lon'] = merged['stop_lon'].astype(float)
-
-    def calc_dist(row):
-        return haversine(pos.latitude, pos.longitude, row['stop_lat'], row['stop_lon'])
-
-    merged['dist'] = merged.apply(calc_dist, axis=1)
-    closest = merged.loc[merged['dist'].idxmin()]
-
-    current_seq = closest['stop_sequence']
-    sched_dt = parse_time(closest['arrival_time'])
-    delay_sec = (pos.timestamp - sched_dt).total_seconds()
+    current_seq = closest["stop_sequence"]
+    closest_sched = arrivals.get(closest["stop_id"])
+    if closest_sched is None:
+        # The closest stop (from the route's representative-trip ordering) isn't in
+        # THIS trip's schedule -- no delay anchor, but the target schedule still holds.
+        return 0, current_seq, target_seq, target_scheduled_dt
+    delay_sec = (pos.timestamp - closest_sched).total_seconds()
 
     return delay_sec, current_seq, target_seq, target_scheduled_dt
 
@@ -182,20 +177,16 @@ class VehiclePrediction:
     direction: str
     status: str
     predicted_at: datetime              # the reference 'now'
-    status_tag: str = ""                # "" | " [STALE DATA]" | " [STATIONARY]"
     trip_id: Optional[str] = None
     stop_id: Optional[str] = None       # the direction's target stop
     # distance / speed
     smooth_distance_m: float = 0.0
     speed_mps: float = 0.0
-    speed_kmh: float = 0.0
-    moving: bool = False                # speed_mps > MOVING_SPEED_MPS
     on_route: bool = False
     dist_tag: str = ""                  # "" | " [straight-line]"
     is_stale: bool = False
     is_stationary: bool = False
     # schedule
-    has_schedule: bool = False
     target_scheduled: Optional[datetime] = None
     status_str: Optional[str] = None    # "Running ... LATE" etc. (scheduled only)
     delay_seconds: Optional[int] = None
@@ -204,6 +195,30 @@ class VehiclePrediction:
     eta_minutes: Optional[float] = None
     predicted_arrival: Optional[datetime] = None   # forward arrival; None for at/passed/unknown
     eta_source: Optional[str] = None    # 'schedule' | 'move' | 'hybrid'
+
+    # Derived single-source-of-truth views. Kept as read-only properties (not stored
+    # fields) so a hand-built or future-edited prediction can never desync the logged
+    # row from the bot's rendered text: speed_kmh / moving follow speed_mps, status_tag
+    # follows the stale/stationary flags, has_schedule follows target_scheduled.
+    @property
+    def speed_kmh(self) -> float:
+        return self.speed_mps * 3.6
+
+    @property
+    def moving(self) -> bool:
+        return self.speed_mps > MOVING_SPEED_MPS
+
+    @property
+    def status_tag(self) -> str:
+        if self.is_stale:
+            return " [STALE DATA]"
+        if self.is_stationary:
+            return " [STATIONARY]"
+        return ""
+
+    @property
+    def has_schedule(self) -> bool:
+        return self.target_scheduled is not None
 
 
 def compute_vehicle_prediction(session, pos, now=None):
@@ -224,17 +239,17 @@ def compute_vehicle_prediction(session, pos, now=None):
     if not target_sched and (is_stale or is_stationary):
         return None
 
-    raw_sma_speed_mps = calculate_sma_speed(session, pos.vehicle_id, pos, num_pings=10)
-
-    # Halt extrapolation for stale / stationary pings.
+    # Halt extrapolation for stale / stationary pings. Only query the SMA speed when
+    # it will actually be used: for a stale or stationary bus the speed is forced to
+    # 0, so the 10-ping DB query (previously run unconditionally and then discarded
+    # for exactly these buses) is skipped entirely.
     if is_stale or is_stationary:
         sma_speed_mps = 0.0
         extrapolate_time = 0.0
     else:
-        sma_speed_mps = raw_sma_speed_mps
+        sma_speed_mps = calculate_sma_speed(session, pos.vehicle_id, pos, num_pings=10)
         extrapolate_time = max(0, time_since_ping)
 
-    sma_speed_kmh = sma_speed_mps * 3.6
     estimated_movement = sma_speed_mps * extrapolate_time
 
     # Distance to this direction's target stop measured ALONG THE ROUTE
@@ -269,14 +284,16 @@ def compute_vehicle_prediction(session, pos, now=None):
     smooth_distance = max(0, raw_distance - min(estimated_movement, raw_distance * 0.8))
 
     direction = "Towards Lemesos" if pos.route_id == "10900011" else "Towards Sanida"
-    status_tag = " [STALE DATA]" if is_stale else (" [STATIONARY]" if is_stationary else "")
+    # moving stays a local (it drives the branch logic below); speed_kmh / status_tag /
+    # has_schedule are now derived properties on VehiclePrediction, so they are not
+    # passed in -- they follow speed_mps / the stale-stationary flags / target_scheduled.
     moving = sma_speed_mps > MOVING_SPEED_MPS
 
     base = dict(
         vehicle_id=pos.vehicle_id, route_id=pos.route_id, direction=direction,
-        predicted_at=now, status_tag=status_tag, trip_id=pos.trip_id, stop_id=target_stop_id,
-        smooth_distance_m=smooth_distance, speed_mps=sma_speed_mps, speed_kmh=sma_speed_kmh,
-        moving=moving, on_route=on_route, dist_tag=dist_tag,
+        predicted_at=now, trip_id=pos.trip_id, stop_id=target_stop_id,
+        smooth_distance_m=smooth_distance, speed_mps=sma_speed_mps,
+        on_route=on_route, dist_tag=dist_tag,
         is_stale=is_stale, is_stationary=is_stationary,
     )
 
@@ -339,7 +356,7 @@ def compute_vehicle_prediction(session, pos, now=None):
             eta_source = "schedule"
 
         return VehiclePrediction(
-            status="scheduled", has_schedule=True, target_scheduled=target_sched,
+            status="scheduled", target_scheduled=target_sched,
             status_str=status_str, delay_seconds=int(delay_sec),
             eta_minutes=eta_minutes, predicted_arrival=expected_time, eta_source=eta_source,
             **base)

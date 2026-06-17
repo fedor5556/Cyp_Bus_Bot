@@ -97,7 +97,10 @@ class PredictionLog(Base):
     prediction *drift* (error vs lead time) and calibrate prediction intervals.
 
     The values are produced by the SAME analysis.eta.compute_vehicle_prediction the
-    ETA bot formats, so what we log is provably what the bot showed.
+    ETA bot formats, so for any single shared invocation the logged row and the bot's
+    text are the same computation. The logger and the live bot invoke it separately
+    (different `now`, and the bot does its own reactive GTFS-RT fetch), so a row is not
+    literally the render a user saw - it is the identical math on each side's inputs.
     """
     __tablename__ = 'prediction_logs'
 

@@ -7,9 +7,10 @@ Exit code 0 = all checks passed, 1 = a check failed.
 Sections:
   1. Branch unit tests - eta.compute_vehicle_prediction, fixed injected `now`,
      the three GTFS/geometry helpers stubbed so every branch is deterministic:
-     at / passed(moving) / passed(stopped) / scheduled(hybrid) / scheduled(stationary)
-     / no_schedule(moving) / no_schedule(unknown) / skipped(None) / straight-line.
-     Asserts status, eta_source, predicted_arrival, has_passed.
+     at / passed(moving) / passed(stopped) / scheduled(hybrid) / scheduled(speed0)
+     / scheduled(stationary-tag) / no_schedule(moving) / no_schedule(unknown)
+     / skipped(None) / straight-line.
+     Asserts status, eta_source, predicted_arrival, has_passed, status_tag.
   2. Formatter golden - predict_eta.format_prediction over hand-built predictions
      must reproduce the bot's exact lines (locks the templates byte-for-byte), plus
      a get_prediction_text() end-to-end assembly golden (header + per-vehicle join).
@@ -121,76 +122,95 @@ def compute(route_id=SANIDA, trip_id="T1", is_stationary=False, lat=34.0, lon=33
 
 print("1. Branch unit tests (compute_vehicle_prediction, fixed now, stubbed deps)")
 
-# A. AT: distance under the 100m radius.
-stub((-120, 5, 10, NOW), 0.0, on_route(50, False))
-p = compute()
-check("AT -> status 'at', no forward arrival",
-      p.status == "at" and p.predicted_arrival is None and not p.has_passed, f"{p.status}")
+# All of section 1 stubs eta's three heavy deps; restore() in a finally so a raise
+# in any assertion path (e.g. p.status when compute unexpectedly returns None) can
+# never leak the stubs into the later sections, which use the REAL functions.
+try:
+    # A. AT: distance under the 100m radius.
+    stub((-120, 5, 10, NOW), 0.0, on_route(50, False))
+    p = compute()
+    check("AT -> status 'at', no forward arrival",
+          p.status == "at" and p.predicted_arrival is None and not p.has_passed, f"{p.status}")
 
-# B. passed, moving.
-stub((0, 12, 10, NOW), 10.0, on_route(2000, True))
-p = compute()
-check("passed+moving -> has_passed, eta_source 'move', no forward arrival",
-      p.status == "passed" and p.has_passed and p.eta_source == "move"
-      and p.predicted_arrival is None and approx(p.eta_minutes, (1700 / 10) / 60),
-      f"status={p.status} eta_min={p.eta_minutes}")
+    # B. passed, moving.
+    stub((0, 12, 10, NOW), 10.0, on_route(2000, True))
+    p = compute()
+    check("passed+moving -> has_passed, eta_source 'move', no forward arrival",
+          p.status == "passed" and p.has_passed and p.eta_source == "move"
+          and p.predicted_arrival is None and approx(p.eta_minutes, (1700 / 10) / 60),
+          f"status={p.status} eta_min={p.eta_minutes}")
 
-# C. passed, stopped -> 8.33 m/s terminal fallback.
-stub((0, 12, 10, NOW), 0.0, on_route(3000, True))
-p = compute()
-check("passed+stopped -> 30km/h fallback eta",
-      p.status == "passed" and not p.moving and approx(p.eta_minutes, (3000 / 8.33) / 60),
-      f"eta_min={p.eta_minutes}")
+    # C. passed, stopped -> 8.33 m/s terminal fallback.
+    stub((0, 12, 10, NOW), 0.0, on_route(3000, True))
+    p = compute()
+    check("passed+stopped -> 30km/h fallback eta",
+          p.status == "passed" and not p.moving and approx(p.eta_minutes, (3000 / 8.33) / 60),
+          f"eta_min={p.eta_minutes}")
 
-# D. scheduled, moving -> hybrid.
-sched = datetime(2026, 6, 16, 12, 10, 0)
-stub((120, 3, 10, sched), 8.0, on_route(5000, False))
-p = compute()
-check("scheduled+moving -> eta_source 'hybrid', forward arrival, delay logged",
-      p.status == "scheduled" and p.eta_source == "hybrid"
-      and p.predicted_arrival is not None and p.delay_seconds == 120
-      and p.status_str == "Running 2 mins LATE",
-      f"src={p.eta_source} status_str={p.status_str!r}")
+    # D. scheduled, moving -> hybrid.
+    sched = datetime(2026, 6, 16, 12, 10, 0)
+    stub((120, 3, 10, sched), 8.0, on_route(5000, False))
+    p = compute()
+    check("scheduled+moving -> eta_source 'hybrid', forward arrival, delay logged",
+          p.status == "scheduled" and p.eta_source == "hybrid"
+          and p.predicted_arrival is not None and p.delay_seconds == 120
+          and p.status_str == "Running 2 mins LATE",
+          f"src={p.eta_source} status_str={p.status_str!r}")
 
-# E. scheduled, stationary -> schedule profile only (clean numbers).
-stub((-300, 8, 10, sched), 0.0, on_route(5000, False))
-p = compute(is_stationary=False)  # speed 0 but not flagged: profile path
-check("scheduled+stopped -> eta_source 'schedule', arrival == 12:05:00, EARLY",
-      p.status == "scheduled" and p.eta_source == "schedule"
-      and p.predicted_arrival == datetime(2026, 6, 16, 12, 5, 0)
-      and approx(p.eta_minutes, 5.0) and p.status_str == "Running 5 mins EARLY",
-      f"src={p.eta_source} arr={p.predicted_arrival} status_str={p.status_str!r}")
+    # E. scheduled, speed 0 but NOT flagged stationary -> schedule profile path.
+    # (This exercises the moving=False branch via a zero SMA speed, NOT a
+    # DB-flagged stationary bus; the genuine-stationary tag is covered in E2.)
+    stub((-300, 8, 10, sched), 0.0, on_route(5000, False))
+    p = compute(is_stationary=False)
+    check("scheduled+speed0 (not flagged) -> eta_source 'schedule', arrival 12:05:00, EARLY",
+          p.status == "scheduled" and p.eta_source == "schedule"
+          and p.predicted_arrival == datetime(2026, 6, 16, 12, 5, 0)
+          and approx(p.eta_minutes, 5.0) and p.status_str == "Running 5 mins EARLY"
+          and p.status_tag == "",
+          f"src={p.eta_source} arr={p.predicted_arrival} status_str={p.status_str!r} tag={p.status_tag!r}")
 
-# F. no schedule, moving -> movement ETA, forward arrival, delay None.
-stub((0, -1, -1, None), 6.0, on_route(4000, False))
-p = compute()
-eta_f = (3820 / 6) / 60  # smooth = 4000 - 6*30
-check("no_schedule+moving -> eta_source 'move', forward arrival, delay None",
-      p.status == "no_schedule" and p.eta_source == "move"
-      and p.predicted_arrival == NOW + timedelta(minutes=p.eta_minutes)
-      and approx(p.eta_minutes, eta_f) and p.delay_seconds is None,
-      f"src={p.eta_source} eta_min={p.eta_minutes}")
+    # E2. scheduled AND DB-flagged stationary -> compute must emit the ' [STATIONARY]'
+    # tag (the bot's render) while still producing a schedule-backed forward arrival.
+    # Previously no test passed is_stationary=True with a schedule, so this tag path
+    # was unverified at the compute level.
+    stub((-300, 8, 10, sched), 0.0, on_route(5000, False))
+    p = compute(is_stationary=True)
+    check("scheduled+stationary -> status_tag ' [STATIONARY]', still schedule-backed",
+          p.status == "scheduled" and p.status_tag == " [STATIONARY]"
+          and p.is_stationary is True and p.eta_source == "schedule"
+          and p.predicted_arrival == datetime(2026, 6, 16, 12, 5, 0),
+          f"tag={p.status_tag!r} src={p.eta_source} arr={p.predicted_arrival}")
 
-# G. no schedule, not moving (but not stale/stationary) -> Unknown, no arrival.
-stub((0, -1, -1, None), 0.5, on_route(4000, False))
-p = compute()
-check("no_schedule+slow -> 'Unknown', no forward arrival",
-      p.status == "no_schedule" and p.predicted_arrival is None
-      and p.eta_minutes is None and p.eta_source is None, f"{p.status}")
+    # F. no schedule, moving -> movement ETA, forward arrival, delay None.
+    stub((0, -1, -1, None), 6.0, on_route(4000, False))
+    p = compute()
+    eta_f = (3820 / 6) / 60  # smooth = 4000 - 6*30
+    check("no_schedule+moving -> eta_source 'move', forward arrival, delay None",
+          p.status == "no_schedule" and p.eta_source == "move"
+          and p.predicted_arrival == NOW + timedelta(minutes=p.eta_minutes)
+          and approx(p.eta_minutes, eta_f) and p.delay_seconds is None,
+          f"src={p.eta_source} eta_min={p.eta_minutes}")
 
-# H. no schedule AND stationary -> vehicle skipped entirely (None).
-stub((0, -1, -1, None), 0.0, on_route(4000, False))
-p = compute(is_stationary=True)
-check("no_schedule+stationary -> compute returns None (skipped)", p is None, f"{p}")
+    # G. no schedule, not moving (but not stale/stationary) -> Unknown, no arrival.
+    stub((0, -1, -1, None), 0.5, on_route(4000, False))
+    p = compute()
+    check("no_schedule+slow -> 'Unknown', no forward arrival",
+          p.status == "no_schedule" and p.predicted_arrival is None
+          and p.eta_minutes is None and p.eta_source is None, f"{p.status}")
 
-# I. off-route -> straight-line fallback (haversine), on_route False, tag set.
-stub((0, -1, -1, None), 5.0, {"ok": False})
-p = compute(lat=34.7416229691767 + 0.05, lon=33.1836621951358)
-check("off-route -> on_route False and ' [straight-line]' tag",
-      p is not None and p.on_route is False and p.dist_tag == " [straight-line]",
-      f"on_route={getattr(p, 'on_route', None)} tag={getattr(p, 'dist_tag', None)!r}")
+    # H. no schedule AND stationary -> vehicle skipped entirely (None).
+    stub((0, -1, -1, None), 0.0, on_route(4000, False))
+    p = compute(is_stationary=True)
+    check("no_schedule+stationary -> compute returns None (skipped)", p is None, f"{p}")
 
-restore()
+    # I. off-route -> straight-line fallback (haversine), on_route False, tag set.
+    stub((0, -1, -1, None), 5.0, {"ok": False})
+    p = compute(lat=34.7416229691767 + 0.05, lon=33.1836621951358)
+    check("off-route -> on_route False and ' [straight-line]' tag",
+          p is not None and p.on_route is False and p.dist_tag == " [straight-line]",
+          f"on_route={getattr(p, 'on_route', None)} tag={getattr(p, 'dist_tag', None)!r}")
+finally:
+    restore()
 
 
 print("2. Formatter golden (locks the bot's exact text templates)")
@@ -214,8 +234,8 @@ check("format: AT", ok, "" if ok else f"got {got}")
 
 # passed, moving, stale tag, straight-line tag
 p = VP(vehicle_id="V2", route_id=LEMESOS, direction="Towards Lemesos", status="passed",
-       predicted_at=NOW, status_tag=" [STALE DATA]", smooth_distance_m=1700.0,
-       speed_kmh=36.0, moving=True, dist_tag=" [straight-line]", has_passed=True,
+       predicted_at=NOW, is_stale=True, smooth_distance_m=1700.0,
+       speed_mps=10.0, dist_tag=" [straight-line]", has_passed=True,
        eta_minutes=2.8, eta_source="move")
 ok, got = golden(p, [
     "Vehicle V2 (Towards Lemesos) [STALE DATA]",
@@ -228,7 +248,7 @@ check("format: passed+moving (+tags)", ok, "" if ok else f"got {got}")
 
 # passed, stopped
 p = VP(vehicle_id="V3", route_id=SANIDA, direction="Towards Sanida", status="passed",
-       predicted_at=NOW, smooth_distance_m=3000.0, speed_kmh=0.0, moving=False,
+       predicted_at=NOW, smooth_distance_m=3000.0, speed_mps=0.0,
        has_passed=True, eta_minutes=6.0, eta_source="move")
 ok, got = golden(p, [
     "Vehicle V3 (Towards Sanida)",
@@ -241,8 +261,8 @@ check("format: passed+stopped", ok, "" if ok else f"got {got}")
 
 # scheduled, moving (hybrid)
 p = VP(vehicle_id="V4", route_id=SANIDA, direction="Towards Sanida", status="scheduled",
-       predicted_at=NOW, smooth_distance_m=4760.0, speed_kmh=28.8, moving=True,
-       has_schedule=True, target_scheduled=datetime(2026, 6, 16, 12, 10, 0),
+       predicted_at=NOW, smooth_distance_m=4760.0, speed_mps=8.0,
+       target_scheduled=datetime(2026, 6, 16, 12, 10, 0),
        status_str="Running 2 mins LATE", delay_seconds=120, eta_minutes=11.0,
        predicted_arrival=datetime(2026, 6, 16, 12, 11, 0), eta_source="hybrid")
 ok, got = golden(p, [
@@ -257,8 +277,8 @@ check("format: scheduled+moving (hybrid)", ok, "" if ok else f"got {got}")
 
 # scheduled, stationary
 p = VP(vehicle_id="V5", route_id=LEMESOS, direction="Towards Lemesos", status="scheduled",
-       predicted_at=NOW, status_tag=" [STATIONARY]", smooth_distance_m=5000.0,
-       speed_kmh=0.0, moving=False, has_schedule=True,
+       predicted_at=NOW, is_stationary=True, smooth_distance_m=5000.0,
+       speed_mps=0.0,
        target_scheduled=datetime(2026, 6, 16, 12, 10, 0),
        status_str="Running 5 mins EARLY", delay_seconds=-300, eta_minutes=5.0,
        predicted_arrival=datetime(2026, 6, 16, 12, 5, 0), eta_source="schedule")
@@ -274,7 +294,7 @@ check("format: scheduled+stationary", ok, "" if ok else f"got {got}")
 
 # no_schedule, moving
 p = VP(vehicle_id="V6", route_id=SANIDA, direction="Towards Sanida", status="no_schedule",
-       predicted_at=NOW, smooth_distance_m=3820.0, speed_kmh=21.6, moving=True,
+       predicted_at=NOW, smooth_distance_m=3820.0, speed_mps=6.0,
        eta_minutes=10.6, predicted_arrival=NOW + timedelta(minutes=10.6), eta_source="move")
 ok, got = golden(p, [
     "Vehicle V6 (Towards Sanida)",
@@ -286,7 +306,7 @@ check("format: no_schedule+moving", ok, "" if ok else f"got {got}")
 
 # no_schedule, not moving (Unknown)
 p = VP(vehicle_id="V7", route_id=SANIDA, direction="Towards Sanida", status="no_schedule",
-       predicted_at=NOW, smooth_distance_m=4000.0, speed_kmh=1.8, moving=False)
+       predicted_at=NOW, smooth_distance_m=4000.0, speed_mps=0.5)
 ok, got = golden(p, [
     "Vehicle V7 (Towards Sanida)",
     "  Distance to Pyrgos Church: 4.0 km (Speed: 1.8 km/h)",
@@ -299,8 +319,8 @@ check("format: no_schedule+unknown", ok, "" if ok else f"got {got}")
 p_at = VP(vehicle_id="V1", route_id=SANIDA, direction="Towards Sanida", status="at",
           predicted_at=NOW)
 p_sched = VP(vehicle_id="V4", route_id=SANIDA, direction="Towards Sanida", status="scheduled",
-             predicted_at=NOW, smooth_distance_m=4760.0, speed_kmh=28.8, moving=True,
-             has_schedule=True, target_scheduled=datetime(2026, 6, 16, 12, 10, 0),
+             predicted_at=NOW, smooth_distance_m=4760.0, speed_mps=8.0,
+             target_scheduled=datetime(2026, 6, 16, 12, 10, 0),
              status_str="Running 2 mins LATE", delay_seconds=120, eta_minutes=11.0,
              predicted_arrival=datetime(2026, 6, 16, 12, 11, 0), eta_source="hybrid")
 
@@ -367,12 +387,12 @@ check("dedup keeps the NEWEST ping for BUS_FWD",
 canned = {
     "BUS_FWD": VP(vehicle_id="BUS_FWD", route_id=SANIDA, direction="Towards Sanida",
                   status="scheduled", predicted_at=NOW, trip_id="TF", stop_id="7604",
-                  smooth_distance_m=4760.0, speed_kmh=28.8, moving=True, on_route=True,
-                  has_schedule=True, delay_seconds=120, eta_minutes=11.0,
+                  smooth_distance_m=4760.0, speed_mps=8.0, on_route=True,
+                  target_scheduled=NOW + timedelta(minutes=10), delay_seconds=120, eta_minutes=11.0,
                   predicted_arrival=NOW + timedelta(minutes=11), eta_source="hybrid"),
     "BUS_MOVE": VP(vehicle_id="BUS_MOVE", route_id=SANIDA, direction="Towards Sanida",
                    status="no_schedule", predicted_at=NOW, trip_id="TM", stop_id="7604",
-                   smooth_distance_m=3000.0, speed_kmh=21.6, moving=True, on_route=True,
+                   smooth_distance_m=3000.0, speed_mps=6.0, on_route=True,
                    eta_minutes=10.0, predicted_arrival=NOW + timedelta(minutes=10),
                    eta_source="move"),
     "BUS_PASS": VP(vehicle_id="BUS_PASS", route_id=SANIDA, direction="Towards Sanida",
@@ -456,39 +476,57 @@ else:
           f"before={before} after={after1}")
 
 
-print("5. Tier A regression guards (new robustness/correctness behavior)")
+print("5. Tier A + Tier C regression guards (get_trip_state caching + robustness)")
 
-# --- #2: get_trip_state survives an empty trip<->stops merge -------------------
-# A GTFS-integrity gap where none of the trip's stops resolve in stops.txt makes
-# pd.merge empty; the old code then raised ValueError on idxmin(). The guard must
-# return the schedule fallback instead. Fully isolated via monkeypatch so it needs
-# no live CSV layout. Restored in finally (test-hygiene).
-import pandas as _pd_real  # noqa: E402
-_o_exists, _o_readcsv, _o_merge = eta.os.path.exists, eta.pd.read_csv, eta.pd.merge
+# --- #10: get_trip_state now reads through the mtime-cached schedule + map_matching
+# helpers instead of re-parsing stop_times.txt + stops.txt with pandas on every call.
+# Happy path: stub the two caches, drop the bus exactly on a known stop, and assert
+# the closest-stop delay, current/target sequences and target schedule are preserved.
+_o_arrivals, _o_ordered = eta.schedule.get_scheduled_arrivals_for_trip, eta.mm.ordered_stops_for_route
+_ARRIVALS = {
+    "100": datetime(2026, 6, 16, 12, 0, 0),
+    "200": datetime(2026, 6, 16, 12, 5, 0),
+    "7604": datetime(2026, 6, 16, 12, 10, 0),  # SANIDA direction's target stop
+}
+_ORDERED = [
+    {"stop_id": "100", "stop_sequence": 1, "lat": 34.70, "lon": 33.10, "dist_along_m": 0.0, "cross_track_m": 0.0},
+    {"stop_id": "200", "stop_sequence": 2, "lat": 34.71, "lon": 33.11, "dist_along_m": 500.0, "cross_track_m": 0.0},
+    {"stop_id": "7604", "stop_sequence": 3, "lat": 34.7416, "lon": 33.1836, "dist_along_m": 3000.0, "cross_track_m": 0.0},
+]
+try:
+    eta.schedule.get_scheduled_arrivals_for_trip = lambda trip_id, date=None: dict(_ARRIVALS)
+    eta.mm.ordered_stops_for_route = lambda route_id: list(_ORDERED)
+    # Bus sitting exactly on stop 200 -> closest is 200 (seq 2). PING_TS is 11:59:30,
+    # so delay vs 200's 12:05:00 schedule is -330 s. Target 7604 is seq 3 @ 12:10.
+    res10 = eta.get_trip_state("T1", Pos("V", SANIDA, "T1", 34.71, 33.11, PING_TS))
+finally:
+    eta.schedule.get_scheduled_arrivals_for_trip = _o_arrivals
+    eta.mm.ordered_stops_for_route = _o_ordered
+check("#10 cached get_trip_state: closest-stop delay + sequences preserved",
+      res10 == (-330.0, 2, 3, datetime(2026, 6, 16, 12, 10, 0)), f"res={res10}")
 
-
-def _fake_read_csv(path, **kw):
-    if 'stop_times' in path:
-        return _pd_real.DataFrame({'trip_id': ['T1', 'T1'],
-                                   'arrival_time': ['12:05:00', '12:10:00'],
-                                   'stop_id': ['9999', '7604'],
-                                   'stop_sequence': ['1', '2']})
-    return _pd_real.DataFrame({'stop_id': ['7604'], 'stop_lat': ['34.7'], 'stop_lon': ['33.1']})
-
-
+# --- #2: get_trip_state degrades gracefully when geometry is unavailable --------
+# A GTFS-integrity gap right after a refresh can leave the schedule index populated
+# but ordered_stops_for_route empty (no stop resolved to the shape). The old pandas
+# path raised ValueError on idxmin() of an empty merge; the refactor must instead
+# skip the closest-stop delay and return the schedule-backed fallback (target still
+# known, current/target sequences -1). Fully isolated via monkeypatch; restored in finally.
+_o_arrivals2, _o_ordered2 = eta.schedule.get_scheduled_arrivals_for_trip, eta.mm.ordered_stops_for_route
 _raised2 = False
 try:
-    eta.os.path.exists = lambda path: True
-    eta.pd.read_csv = _fake_read_csv
-    eta.pd.merge = lambda *a, **kw: _pd_real.DataFrame(
-        columns=['trip_id', 'arrival_time', 'stop_id', 'stop_sequence', 'stop_lat', 'stop_lon'])
+    eta.schedule.get_scheduled_arrivals_for_trip = lambda trip_id, date=None: {
+        "9999": datetime(2026, 6, 16, 12, 5, 0),
+        "7604": datetime(2026, 6, 16, 12, 10, 0),
+    }
+    eta.mm.ordered_stops_for_route = lambda route_id: []
     res2 = eta.get_trip_state("T1", Pos("V2", SANIDA, "T1", 34.0, 33.0, PING_TS))
-except Exception as e:  # the bug would surface here as ValueError
+except Exception as e:  # any crash in the no-geometry path would surface here
     _raised2, res2 = True, ("RAISED", repr(e))
 finally:
-    eta.os.path.exists, eta.pd.read_csv, eta.pd.merge = _o_exists, _o_readcsv, _o_merge
-check("#2 empty merge -> schedule fallback, no ValueError",
-      not _raised2 and res2 == (0, -1, 2, datetime(2026, 6, 16, 12, 10, 0)),
+    eta.schedule.get_scheduled_arrivals_for_trip = _o_arrivals2
+    eta.mm.ordered_stops_for_route = _o_ordered2
+check("#2 schedule known + no geometry -> schedule fallback, no crash",
+      not _raised2 and res2 == (0, -1, -1, datetime(2026, 6, 16, 12, 10, 0)),
       f"raised={_raised2} res={res2}")
 
 # --- #7: extrapolation no longer collapses a measured-far bus into a false 'at' -
@@ -558,11 +596,11 @@ session4.commit()
 _canned4 = {
     "GOOD1": VP(vehicle_id="GOOD1", route_id=SANIDA, direction="Towards Sanida",
                 status="no_schedule", predicted_at=NOW, trip_id="G1", stop_id="7604",
-                smooth_distance_m=3000.0, speed_kmh=21.6, moving=True, on_route=True,
+                smooth_distance_m=3000.0, speed_mps=6.0, on_route=True,
                 eta_minutes=10.0, predicted_arrival=NOW + timedelta(minutes=10), eta_source="move"),
     "GOOD2": VP(vehicle_id="GOOD2", route_id=SANIDA, direction="Towards Sanida",
                 status="no_schedule", predicted_at=NOW, trip_id="G2", stop_id="7604",
-                smooth_distance_m=2000.0, speed_kmh=18.0, moving=True, on_route=True,
+                smooth_distance_m=2000.0, speed_mps=5.0, on_route=True,
                 eta_minutes=8.0, predicted_arrival=NOW + timedelta(minutes=8), eta_source="move"),
 }
 
@@ -597,12 +635,12 @@ session4b.add_all([
 session4b.commit()
 _canned4b = {
     "OK1": VP(vehicle_id="OK1", route_id=SANIDA, direction="Towards Sanida", status="no_schedule",
-              predicted_at=NOW, trip_id="K1", stop_id="7604", smooth_distance_m=1000.0, speed_kmh=18.0,
-              moving=True, on_route=True, eta_minutes=5.0, predicted_arrival=NOW + timedelta(minutes=5),
+              predicted_at=NOW, trip_id="K1", stop_id="7604", smooth_distance_m=1000.0, speed_mps=5.0,
+              on_route=True, eta_minutes=5.0, predicted_arrival=NOW + timedelta(minutes=5),
               eta_source="move"),
     "OK2": VP(vehicle_id="OK2", route_id=SANIDA, direction="Towards Sanida", status="no_schedule",
-              predicted_at=NOW, trip_id="K2", stop_id="7604", smooth_distance_m=1500.0, speed_kmh=20.0,
-              moving=True, on_route=True, eta_minutes=6.0, predicted_arrival=NOW + timedelta(minutes=6),
+              predicted_at=NOW, trip_id="K2", stop_id="7604", smooth_distance_m=1500.0, speed_mps=20.0 / 3.6,
+              on_route=True, eta_minutes=6.0, predicted_arrival=NOW + timedelta(minutes=6),
               eta_source="move"),
 }
 
