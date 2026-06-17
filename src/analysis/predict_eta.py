@@ -400,6 +400,7 @@ async def cmd_pull(update, context):
 
 def start_bot():
     from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+    from telegram.error import NetworkError, TimedOut
     import logging
     import socket
     logging.basicConfig(level=logging.INFO)
@@ -424,7 +425,15 @@ def start_bot():
         return
 
     print("Starting Telegram Bot...")
-    app = ApplicationBuilder().token(token).build()
+    # Slightly more generous network timeouts than the defaults so a brief blip on the
+    # (residential) server connection doesn't abort a reply send or a getUpdates long
+    # poll. get_updates_read_timeout must exceed the long-poll window (~10 s).
+    app = (
+        ApplicationBuilder().token(token)
+        .read_timeout(30).write_timeout(30).connect_timeout(15).pool_timeout(15)
+        .get_updates_read_timeout(40)
+        .build()
+    )
     # Admin-gated handlers MUST be registered before the catch-all: python-telegram-bot
     # runs only the first matching handler per group, so the catch-all would otherwise
     # swallow /pushdb, /pull, /armb2, and document uploads.
@@ -433,6 +442,19 @@ def start_bot():
     app.add_handler(CommandHandler("pull", cmd_pull))
     app.add_handler(CommandHandler("armb2", cmd_armb2))
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, bot_handler))
+
+    # Transient network blips (httpx.ReadError / TimedOut) are routine for a long-poll
+    # bot on a home connection; PTB auto-retries getUpdates, but with no error handler
+    # an error raised while sending a reply dumps a full traceback to the log. Collapse
+    # those to a one-line WARNING; still log genuine bugs with a full traceback.
+    async def _on_error(update, context):
+        if isinstance(context.error, (NetworkError, TimedOut)):
+            logging.warning("Transient Telegram network blip (auto-retried): %s",
+                            type(context.error).__name__)
+        else:
+            logging.error("Unhandled bot error", exc_info=context.error)
+
+    app.add_error_handler(_on_error)
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
