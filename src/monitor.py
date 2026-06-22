@@ -1,6 +1,7 @@
 import time
 import os
 import sys
+import shutil
 from datetime import datetime, timedelta
 
 # Add parent directory to path so we can import our scripts
@@ -86,24 +87,53 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
                 except Exception as e:
                     print(f"Cloud DB backup skipped: {e}")
 
-            # 0d. Deliver the Voice Transcriber's .env from cloud storage if it is
-            # not on this machine yet. Retries every 10 min (so it works no matter
-            # when the layer is armed or the object is uploaded) and stops touching
-            # the network once the file exists - its existence is the sentinel.
-            # The primary delivery path is now a Telegram DM to the bot; this is
-            # the fallback for when that is forgotten.
+            # 0d. Sync project .env files FROM cloud storage (Backblaze B2 is the
+            # canonical source for these secrets). This is the out-of-band recovery
+            # channel for DELIVERING or ROTATING a bot's secrets when its own inbound
+            # .env handler is offline - e.g. after a leaked bus-bot token is revoked,
+            # which is exactly what takes the normal DM channel down. The Admin Hub
+            # ships code; B2 ships secrets; this still-running monitor is the puller.
+            #
+            # Runs every 10 min. For each mapping it pulls the object to a temp file,
+            # validates it, and replaces the local .env ONLY when the content differs
+            # (idempotent: no needless writes, no overwrite loop, no revert once in
+            # sync). The previous .env is kept as .env.bak. A change takes effect when
+            # that bot is restarted via the Admin Hub. To rotate: upload the new .env
+            # to B2 (web console) as the object below; the server picks it up here.
             if datetime.now() - last_env_pull > timedelta(minutes=10):
                 last_env_pull = datetime.now()
-                try:
-                    sibling = os.path.join(os.path.dirname(Config.BASE_DIR), "Constan_transcriber_telegram_bot")
-                    transcriber_env = os.path.join(sibling, ".env")
-                    if (cloud_sync.is_configured() and os.path.isdir(sibling)
-                            and not os.path.exists(transcriber_env)):
-                        if cloud_sync.pull("transcriber/.env", transcriber_env,
-                                           validate_contains="PUBLIC_BOT_TOKEN", no_clobber=True):
-                            print(f"[{current_time}] Transcriber .env delivered from cloud storage.")
-                except Exception as e:
-                    print(f"Cloud transcriber .env pull skipped: {e}")
+                projects_root = os.path.dirname(Config.BASE_DIR)
+                env_sources = [
+                    # (B2 object name,   local .env path,                                              required marker)
+                    ("bus/.env",         os.path.join(Config.BASE_DIR, ".env"),                        "TELEGRAM_BOT_TOKEN"),
+                    ("transcriber/.env", os.path.join(projects_root, "Constan_transcriber_telegram_bot", ".env"), "PUBLIC_BOT_TOKEN"),
+                ]
+                for obj, dest, marker in env_sources:
+                    try:
+                        if not (cloud_sync.is_configured() and os.path.isdir(os.path.dirname(dest))):
+                            continue
+                        tmp = dest + ".fromcloud"
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                        # Pull to temp (no_clobber safe: tmp was just removed), validate it
+                        # really is that .env, then swap in only if it actually changed.
+                        if not cloud_sync.pull(obj, tmp, validate_contains=marker, no_clobber=True):
+                            continue
+                        with open(tmp, "rb") as f:
+                            new_bytes = f.read()
+                        cur_bytes = b""
+                        if os.path.exists(dest):
+                            with open(dest, "rb") as f:
+                                cur_bytes = f.read()
+                        if new_bytes and new_bytes != cur_bytes:
+                            if os.path.exists(dest):
+                                shutil.copy2(dest, dest + ".bak")
+                            os.replace(tmp, dest)
+                            print(f"[{current_time}] {obj} synced from cloud -> {dest}. Restart that bot via the Admin Hub to apply.")
+                        else:
+                            os.remove(tmp)
+                    except Exception as e:
+                        print(f"Cloud .env sync skipped for {obj}: {e}")
 
             # 1. Fetch Live Data quietly
             fetch_realtime_data(quiet=True)
