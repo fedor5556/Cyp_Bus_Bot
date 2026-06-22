@@ -4,6 +4,7 @@ import sys
 import json
 import shutil
 import asyncio
+import subprocess
 from datetime import datetime
 
 # Add parent directory to path so we can import config and models
@@ -398,6 +399,105 @@ async def cmd_pull(update, context):
         await update.message.reply_text("Pull failed (see server logs).")
 
 
+# Bootstrap channel: only public github.com HTTPS repos. This matches the
+# "every bot is a public repo updated via the Hub" model, and a strict host +
+# shape check stops the URL from being misread as a git flag or another scheme.
+_GIT_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?(?:\.git)?/?$")
+
+
+def _clone_repo(url, dest):
+    """Blocking git clone (run via asyncio.to_thread). Shallow: we only need the
+    code; the server never pushes from these working copies."""
+    return subprocess.run(
+        ["git", "clone", "--depth", "1", "--", url, dest],
+        capture_output=True, text=True, timeout=180,
+    )
+
+
+async def cmd_deploy(update, context):
+    """Bootstrap a NEW sibling project onto the server by cloning its PUBLIC GitHub
+    repo next to the other projects. This is the one thing the Admin Hub's /update
+    cannot do -- /update only fast-forwards a repo that is ALREADY on disk, it never
+    clones. Ongoing updates still go through the Hub; this is first-deploy only.
+    Usage: /deploy <https github url> [folder]
+    """
+    if not _is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /deploy <https github url> [folder]\n"
+            "Clones a PUBLIC GitHub repo as a new sibling project. "
+            "Projects already on the server update via the Admin Hub instead."
+        )
+        return
+
+    url = context.args[0]
+    if not _GIT_URL_RE.match(url):
+        await update.message.reply_text(
+            "Rejected: only public https://github.com/<owner>/<repo> URLs are allowed."
+        )
+        return
+
+    # Folder = explicit second arg, else the repo name from the URL.
+    repo_name = url.rstrip("/").rsplit("/", 1)[-1]
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+    folder = context.args[1] if len(context.args) > 1 else repo_name
+    # Strict charset = no path traversal (no slashes, dots, drive letters).
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", folder):
+        await update.message.reply_text(
+            f"Rejected: '{folder}' is not a valid folder name (letters, digits, _ and - only)."
+        )
+        return
+
+    projects_root = os.path.dirname(Config.BASE_DIR)
+    dest = os.path.join(projects_root, folder)
+    if os.path.exists(dest):
+        await update.message.reply_text(
+            f"Rejected: '{folder}' already exists. Update it via the Admin Hub, not /deploy."
+        )
+        return
+
+    # The runner kills workers by matching folder names, so no sibling folder may be
+    # a prefix of another (see runner_projects.json _README).
+    try:
+        siblings = [d for d in os.listdir(projects_root)
+                    if os.path.isdir(os.path.join(projects_root, d))]
+    except OSError:
+        siblings = []
+    clash = next((s for s in siblings
+                  if s != folder and (s.startswith(folder) or folder.startswith(s))), None)
+    if clash:
+        await update.message.reply_text(
+            f"Rejected: folder '{folder}' collides with existing '{clash}' "
+            "(one name is a prefix of the other; the runner needs distinct names)."
+        )
+        return
+
+    await update.message.reply_text(f"Cloning {url} -> {folder}/ ...")
+    try:
+        proc = await asyncio.to_thread(_clone_repo, url, dest)
+    except Exception as e:
+        shutil.rmtree(dest, ignore_errors=True)
+        await update.message.reply_text(f"Clone failed to start: {e}")
+        return
+
+    if proc.returncode != 0:
+        # Leave no half-cloned directory behind so a retry starts clean.
+        shutil.rmtree(dest, ignore_errors=True)
+        tail = (proc.stderr or proc.stdout or "").strip()[-500:]
+        await update.message.reply_text(f"Clone failed (exit {proc.returncode}):\n{tail}")
+        return
+
+    await update.message.reply_text(
+        f"Cloned into {folder}/. Next steps:\n"
+        f"1) DM this project's .env with caption '{folder}'.\n"
+        f"2) Register '{folder}' in the Hub's projects.json + runner_projects.json, "
+        f"push, then /update the Hub.\n"
+        f"3) /launch {folder} from the Hub once to build its venv; the runner then adopts it."
+    )
+
+
 def start_bot():
     from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
     from telegram.error import NetworkError, TimedOut
@@ -441,6 +541,7 @@ def start_bot():
     app.add_handler(CommandHandler("pushdb", cmd_pushdb))
     app.add_handler(CommandHandler("pull", cmd_pull))
     app.add_handler(CommandHandler("armb2", cmd_armb2))
+    app.add_handler(CommandHandler("deploy", cmd_deploy))
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, bot_handler))
 
     # Transient network blips (httpx.ReadError / TimedOut) are routine for a long-poll
