@@ -4,6 +4,7 @@ import sys
 import json
 import shutil
 import asyncio
+import hashlib
 import subprocess
 from datetime import datetime
 
@@ -12,6 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from db.models import get_session
 from analysis import eta
 from config import Config
+import cloud_sync
 
 
 def format_prediction(p):
@@ -180,6 +182,81 @@ ENV_TARGET_ALIASES = {
     "transcriber": "Constan_transcriber_telegram_bot",
 }
 
+# B2 objects that monitor.py's 10-minute env sync PULLS (cloud -> local, cloud
+# canonical). Mirror of env_sources in monitor.start_monitoring - keep in sync.
+# For these, a failed push after a DM delivery means the stale cloud copy will
+# REVERT the local file, so the reply must scream about it.
+PULLED_ENV_OBJECTS = {"bus/.env", "transcriber/.env"}
+
+
+def _b2_env_object(folder_name):
+    """The B2 object name for a project's .env ('transcriber/.env' etc.) -
+    the reverse of ENV_TARGET_ALIASES, so the DM delivery pushes to the same
+    object monitor.py pulls from. Unknown projects get '<folder>/.env', which
+    the sync never pulls - the push is then just a cloud backup."""
+    if folder_name == os.path.basename(Config.BASE_DIR):
+        return "bus/.env"
+    for alias, folder in ENV_TARGET_ALIASES.items():
+        if folder == folder_name:
+            return alias + "/.env"
+    return folder_name + "/.env"
+
+
+def _resolve_env_target(target):
+    """Alias/folder -> sibling folder name, or None if the name is unsafe.
+    Shared by the .env delivery and /envrestore so they can never disagree."""
+    folder_name = ENV_TARGET_ALIASES.get(target.lower(), target)
+    if target.lower() == "bus":
+        folder_name = os.path.basename(Config.BASE_DIR)
+    # Strict charset = no path traversal (no slashes, dots, drive letters).
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", folder_name):
+        return None
+    return folder_name
+
+
+def _missing_required_keys(folder_name, env_text):
+    """Required key names for this project per Admin_hub/projects.json
+    ('env_keys') that the delivered file does NOT define (or defines empty).
+    Catches a wrong/truncated .env at delivery time, before a restart breaks
+    the bot. Best-effort: no projects.json, no entry, no env_keys -> []."""
+    try:
+        hub_projects = os.path.join(os.path.dirname(Config.BASE_DIR),
+                                    "Admin_hub", "projects.json")
+        with open(hub_projects, "r", encoding="utf-8-sig") as f:
+            entries = json.load(f)
+        required = []
+        for spec in entries.values():
+            path = (spec.get("path") or "").replace("\\", "/").rstrip("/")
+            if path.rsplit("/", 1)[-1] == folder_name:
+                required = spec.get("env_keys", [])
+                break
+        if not required:
+            return []
+        have = set()
+        for line in env_text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                if val.strip():
+                    have.add(key.strip())
+        return [k for k in required if k not in have]
+    except Exception:
+        return []
+
+
+def _cloud_env_note(dest, obj):
+    """Push a project's .env to B2 and describe the outcome for the reply."""
+    if not cloud_sync.is_configured():
+        return "☁️ Cloud layer not armed - local file only (no sync conflict possible)."
+    if cloud_sync.push(dest, obj):
+        return f"☁️ Cloud copy '{obj}' updated too - the 10-min env sync stays in step."
+    if obj in PULLED_ENV_OBJECTS:
+        return (f"🚨 FAILED to update the cloud copy '{obj}'. If a different copy exists in "
+                f"the bucket, the 10-min env sync will OVERWRITE the local file! Fix B2 (or "
+                f"re-upload '{obj}' in the B2 console) and resend, then verify the "
+                f"fingerprint via the Hub's /env_check.")
+    return f"⚠️ Cloud backup push of '{obj}' failed (harmless: nothing pulls it back)."
+
 
 def _is_admin(update):
     """Numeric-ID admin gate. Fails closed when Config.ADMIN_IDS is empty (no env)."""
@@ -235,12 +312,9 @@ async def _env_upload(update, context, doc):
         )
         return
 
-    folder_name = ENV_TARGET_ALIASES.get(target.lower(), target)
-    if target.lower() == "bus":
-        folder_name = os.path.basename(Config.BASE_DIR)
-    # Strict charset = no path traversal (no slashes, dots, drive letters).
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", folder_name):
-        await msg.reply_text(f"Rejected: '{folder_name}' is not a valid project folder name.")
+    folder_name = _resolve_env_target(target)
+    if folder_name is None:
+        await msg.reply_text(f"Rejected: '{target}' is not a valid project folder name.")
         return
 
     projects_root = os.path.dirname(Config.BASE_DIR)
@@ -281,14 +355,44 @@ async def _env_upload(update, context, doc):
         part_path = dest + ".part"
         with open(part_path, "wb") as f:
             f.write(data)
+            f.flush()
+            os.fsync(f.fileno())  # survive a power cut right after delivery
         os.replace(part_path, dest)
     except Exception as e:
         await msg.reply_text(f"Failed to write .env: {e}")
         return
 
+    # Verification facts: key NAMES and a content fingerprint, never values.
+    # The Hub's /env_check shows the same sha256[:10] of the on-disk file, so
+    # "what I sent" and "what the project will read at next start" can be
+    # compared at a glance instead of testing by hand.
+    fingerprint = hashlib.sha256(data).hexdigest()[:10]
+    key_names = sorted(set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=", text, re.MULTILINE)))
+
+    # Keep the cloud copy in step with the local file. monitor.py's env sync
+    # treats B2 as canonical for PULLED_ENV_OBJECTS: before this push existed,
+    # a DM-delivered .env was silently REVERTED to the stale cloud copy within
+    # 10 minutes - and nobody noticed until the next restart (a power outage,
+    # weeks later) applied the old file. Real incident: a freshly allowed
+    # transcriber user lost access after a reboot.
+    cloud_note = _cloud_env_note(dest, _b2_env_object(folder_name))
+
+    # A structurally valid file can still be the WRONG file (another project's
+    # env, a truncated one). Compare against the Hub registry's required keys
+    # and warn now, while /envrestore can still undo it in one command.
+    missing = _missing_required_keys(folder_name, text)
+    warn = ""
+    if missing:
+        warn = ("\n🚨 WARNING: missing required keys per projects.json: {}. "
+                "If that was a mistake, send /envrestore {} to undo this "
+                "delivery.".format(", ".join(missing), target))
+
     note = " (previous .env saved as .env.bak)" if backed_up else ""
     await msg.reply_text(
         f"Wrote {len(data)} bytes to {folder_name}/.env{note}.\n"
+        f"Keys: {', '.join(key_names)}\n"
+        f"Fingerprint: {fingerprint} (compare with /env_check in the Hub)\n"
+        f"{cloud_note}{warn}\n"
         f"Restart that project via the Admin Hub to apply it."
     )
 
@@ -354,6 +458,66 @@ async def cmd_armb2(update, context):
     await update.effective_chat.send_message(
         "B2 application key stored - cloud transfer layer armed. "
         "(Your message was deleted to scrub the key.)"
+    )
+
+
+async def cmd_envrestore(update, context):
+    """Undo a bad .env delivery in one command: swap <project>/.env with the
+    .env.bak the delivery channel saved before overwriting. The bad file
+    becomes the new .env.bak (so a restore is itself reversible), and the
+    restored file is pushed to B2 so the 10-min env sync cannot re-apply the
+    bad one. Takes effect at that project's next restart via the Hub.
+    Usage: /envrestore <project folder or alias>"""
+    if not _is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /envrestore <project>  (folder name, or alias like 'transcriber'/'bus').\n"
+            "Swaps that project's .env with its .env.bak - undoes the last .env delivery."
+        )
+        return
+    target = context.args[0]
+    folder_name = _resolve_env_target(target)
+    if folder_name is None:
+        await update.message.reply_text(f"Rejected: '{target}' is not a valid project folder name.")
+        return
+    target_dir = os.path.join(os.path.dirname(Config.BASE_DIR), folder_name)
+    dest = os.path.join(target_dir, ".env")
+    bak = dest + ".bak"
+    if not os.path.isfile(bak):
+        await update.message.reply_text(
+            f"No {folder_name}/.env.bak found - nothing to restore.")
+        return
+    try:
+        with open(bak, "rb") as f:
+            good = f.read()
+        bad = None
+        if os.path.isfile(dest):
+            with open(dest, "rb") as f:
+                bad = f.read()
+        # Restore first (atomic + fsync), only then overwrite the .bak with the
+        # bad file - so a crash mid-way can never leave BOTH copies bad.
+        part_path = dest + ".part"
+        with open(part_path, "wb") as f:
+            f.write(good)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(part_path, dest)
+        if bad is not None:
+            with open(bak, "wb") as f:
+                f.write(bad)
+    except Exception as e:
+        await update.message.reply_text(f"Restore failed: {e}")
+        return
+
+    fingerprint = hashlib.sha256(good).hexdigest()[:10]
+    cloud_note = _cloud_env_note(dest, _b2_env_object(folder_name))
+    swapped = " The replaced file is now .env.bak (run /envrestore again to swap back)." if bad is not None else ""
+    await update.message.reply_text(
+        f"Restored {folder_name}/.env from .env.bak ({len(good)} bytes).{swapped}\n"
+        f"Fingerprint: {fingerprint} (compare with /env_check in the Hub)\n"
+        f"{cloud_note}\n"
+        f"Restart that project via the Admin Hub to apply it."
     )
 
 
@@ -542,6 +706,7 @@ def start_bot():
     app.add_handler(CommandHandler("pull", cmd_pull))
     app.add_handler(CommandHandler("armb2", cmd_armb2))
     app.add_handler(CommandHandler("deploy", cmd_deploy))
+    app.add_handler(CommandHandler("envrestore", cmd_envrestore))
     app.add_handler(MessageHandler(filters.TEXT | filters.COMMAND, bot_handler))
 
     # Transient network blips (httpx.ReadError / TimedOut) are routine for a long-poll

@@ -130,6 +130,21 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
                                 shutil.copy2(dest, dest + ".bak")
                             os.replace(tmp, dest)
                             print(f"[{current_time}] {obj} synced from cloud -> {dest}. Restart that bot via the Admin Hub to apply.")
+                            # NEVER replace a .env silently. The one time this ran
+                            # quietly it reverted a freshly DM-delivered allowlist to
+                            # the stale cloud copy, and nobody knew until a power
+                            # outage restarted that bot on the old file weeks later.
+                            try:
+                                from analysis.predict_eta import send_telegram_alert
+                                send_telegram_alert(
+                                    f"☁️ {obj}: the local .env was just REPLACED from the "
+                                    f"cloud copy (old file kept as .env.bak). Expected if you "
+                                    f"uploaded it to B2 yourself; if NOT, a stale cloud copy "
+                                    f"has overwritten a newer local file - resend the right "
+                                    f".env by DM and compare fingerprints with /env_check in "
+                                    f"the Hub. Applies at that bot's next restart.")
+                            except Exception as alert_err:
+                                print(f"Env-sync alert failed: {alert_err}")
                         else:
                             os.remove(tmp)
                     except Exception as e:
