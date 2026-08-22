@@ -40,8 +40,22 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
     last_schedule_update = datetime.now()
 
     last_weather_update = datetime.min # Force immediate weather update
-    last_db_backup = datetime.min # Push a DB backup early, then every 12h
     last_env_pull = datetime.min # Retry transcriber .env delivery every 10 min
+
+    # Cloud DB backup pacing (see 0c). The clock advances on EVERY attempt, not
+    # just successful ones, and it survives a restart via a small marker file --
+    # otherwise a monitor that restarts often turns "back up shortly after start"
+    # into "back up every few minutes", which is half of how the B2 bucket filled.
+    BACKUP_KEEP = 20                        # ~10 days of 12-hourly snapshots
+    backup_marker = os.path.join(Config.BASE_DIR, "data", ".last_cloud_backup")
+    backup_interval = timedelta(hours=12)
+    backup_failures = 0
+    last_db_backup = datetime.min
+    try:
+        with open(backup_marker, "r", encoding="utf-8") as f:
+            last_db_backup = datetime.fromisoformat(f.read().strip())
+    except Exception:
+        pass
     last_prediction_log = datetime.min # Snapshot ETA predictions every 60s (drift dataset)
     
     try:
@@ -74,16 +88,57 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
                 last_weather_update = datetime.now()
 
             # 0c. Push a DB backup to cloud storage every 12h (and once shortly
-            # after the layer is armed). No-op while unarmed; last_db_backup only
-            # advances on a successful push, so arming triggers a prompt backup.
-            if datetime.now() - last_db_backup > timedelta(hours=12):
+            # after the layer is armed). No-op while unarmed.
+            #
+            # THE CLOCK ADVANCES ON EVERY ATTEMPT, success or failure. The original
+            # version advanced it only on success, which turned any *persistent* B2
+            # failure into a retry on every 10-second loop tick: ~8,600 authorize +
+            # list_buckets calls a day against a 2,500/day free Class C budget. That
+            # is how the Backblaze transaction cap hit 100% on 2026-08-23 and stayed
+            # there -- a capped account fails the retries too, so the loop fed itself.
+            # A failure now backs off 30m -> 1h -> 2h -> 4h, capped at the normal 12h.
+            if (datetime.now() - last_db_backup > backup_interval
+                    and cloud_sync.is_configured()):
+                last_db_backup = datetime.now()
                 try:
-                    if cloud_sync.is_configured():
-                        db_path = os.path.join(Config.BASE_DIR, "data", "bus_data.db")
-                        result = cloud_sync.push_db_backup(db_path)
-                        if result:
-                            print(f"[{current_time}] DB backup pushed to cloud: {result}")
-                            last_db_backup = datetime.now()
+                    with open(backup_marker, "w", encoding="utf-8") as f:
+                        f.write(last_db_backup.isoformat())
+                except Exception:
+                    pass
+                try:
+                    db_path = os.path.join(Config.BASE_DIR, "data", "bus_data.db")
+                    result = cloud_sync.push_db_backup(db_path)
+                    if result:
+                        backup_failures = 0
+                        backup_interval = timedelta(hours=12)
+                        print(f"[{current_time}] DB backup pushed to cloud: {result}")
+                        # Client-side retention. The B2 lifecycle rule was never
+                        # applied by hand, so 12-hourly ~90 MB snapshots marched the
+                        # bucket toward the 10 GB free cap; a full bucket fails every
+                        # upload, which is what triggered the retry storm above.
+                        removed = cloud_sync.prune_old_backups(keep=BACKUP_KEEP)
+                        if removed:
+                            print(f"[{current_time}] Pruned {removed} old cloud backup(s); "
+                                  f"kept the newest {BACKUP_KEEP}.")
+                    else:
+                        backup_failures += 1
+                        backup_interval = min(
+                            timedelta(hours=12),
+                            timedelta(minutes=30) * (2 ** (backup_failures - 1)))
+                        print(f"[{current_time}] DB backup FAILED ({backup_failures}x in a row). "
+                              f"Next attempt in {backup_interval}.")
+                        if backup_failures == 3:
+                            try:
+                                from analysis.predict_eta import send_telegram_alert
+                                open_, reason, until = cloud_sync.breaker_status()
+                                send_telegram_alert(
+                                    f"☁️ Cloud DB backup has failed 3 times in a row"
+                                    + (f" ({reason}, paused until {until} UTC)" if open_ else "")
+                                    + ". Backups are NOT reaching B2 - check the bucket's "
+                                      "storage/transaction caps. Local data collection is "
+                                      "unaffected; retries are backing off, not hammering.")
+                            except Exception as alert_err:
+                                print(f"Backup alert failed: {alert_err}")
                 except Exception as e:
                     print(f"Cloud DB backup skipped: {e}")
 
