@@ -16,6 +16,8 @@ never spends a real transaction. Sections:
   3. The circuit breaker: a "Transaction cap exceeded" refusal parks pull / push /
      push_db_backup / prune_old_backups until the next UTC midnight, spending
      exactly zero further transactions.
+  3b. A *storage* cap refusal deliberately does NOT park the breaker - a full
+     bucket is fixed by deleting (free), and parking would deadlock the prune.
   4. The breaker closes itself once that deadline passes.
   5. prune_old_backups keeps the newest N snapshots PLUS the first snapshot of
      every calendar month, ignores non-snapshot objects, and is idempotent.
@@ -101,6 +103,13 @@ check("push() is a no-op while parked", cloud_sync.push(KEY, "bus/x") is False)
 check("push_db_backup() is a no-op while parked", cloud_sync.push_db_backup(KEY) is False)
 check("prune_old_backups() is a no-op while parked", cloud_sync.prune_old_backups() == 0)
 check("ZERO B2 transactions spent while parked", calls == before)
+
+print("3b. a STORAGE cap refusal must NOT park the breaker (deleting is the fix)")
+cloud_sync._breaker_until = None
+cloud_sync._note_failure(Exception("Cannot upload files, storage cap exceeded"))
+check("breaker stays closed on a storage-cap refusal", cloud_sync._breaker_open() is False)
+check("prune is therefore still allowed to run and free space",
+      cloud_sync.prune_old_backups(keep=20) == 0)   # nothing stored yet in this run
 
 print("4. breaker reopens once the cap resets")
 cloud_sync._breaker_until = datetime.now(timezone.utc) - timedelta(seconds=1)

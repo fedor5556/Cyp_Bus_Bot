@@ -127,6 +127,15 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
                             timedelta(minutes=30) * (2 ** (backup_failures - 1)))
                         print(f"[{current_time}] DB backup FAILED ({backup_failures}x in a row). "
                               f"Next attempt in {backup_interval}.")
+                        # Prune on FAILURE too, not just on success: the most likely
+                        # reason an upload is refused is a full bucket, and that is
+                        # fixed by deleting (Class A, free), never by waiting. Pruning
+                        # only after a successful push would deadlock exactly when it
+                        # is needed. No-op if the breaker is parked on a transaction cap.
+                        freed = cloud_sync.prune_old_backups(keep=BACKUP_KEEP)
+                        if freed:
+                            print(f"[{current_time}] Freed space: pruned {freed} old backup(s) "
+                                  f"before the next attempt.")
                         if backup_failures == 3:
                             try:
                                 from analysis.predict_eta import send_telegram_alert

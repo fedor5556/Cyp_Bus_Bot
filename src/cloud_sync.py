@@ -78,7 +78,14 @@ def _note_failure(exc):
         _cached_bucket = None  # a failed call may mean a stale/broken auth
         msg = str(exc).lower()
         now = datetime.now(timezone.utc)
-        if "cap exceeded" in msg or "transaction cap" in msg or "storage cap" in msg:
+        if "storage cap" in msg or "storage_cap" in msg:
+            # A FULL bucket is fixed by DELETING, not by waiting, and deletes are
+            # Class A (free). Parking here would deadlock: no upload -> no prune ->
+            # never any room. Leave the breaker closed so the caller can prune.
+            print("[cloud_sync] B2 storage cap exceeded - the bucket is full. "
+                  "Retention prune is the fix here, not a retry.")
+            return
+        if "cap exceeded" in msg or "transaction cap" in msg:
             # B2 caps are daily and reset at UTC midnight.
             tomorrow = (now + timedelta(days=1)).replace(
                 hour=0, minute=5, second=0, microsecond=0)
