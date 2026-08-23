@@ -57,6 +57,7 @@ _cached_bucket_key = None
 
 _breaker_until = None
 _breaker_reason = ""
+_last_error = ""          # last B2 refusal, verbatim, for remote diagnosis
 
 
 def _breaker_open():
@@ -73,9 +74,10 @@ def _breaker_open():
 def _note_failure(exc):
     """Inspect a B2 failure and, if it is one that MORE requests cannot fix, park
     the layer instead of hammering it. Never raises."""
-    global _breaker_until, _breaker_reason, _cached_bucket
+    global _breaker_until, _breaker_reason, _cached_bucket, _last_error
     try:
         _cached_bucket = None  # a failed call may mean a stale/broken auth
+        _last_error = f"{type(exc).__name__}: {exc}"
         msg = str(exc).lower()
         now = datetime.now(timezone.utc)
         if "storage cap" in msg or "storage_cap" in msg:
@@ -106,6 +108,37 @@ def breaker_status():
     if not _breaker_open():
         return (False, "", "")
     return (True, _breaker_reason, _breaker_until.isoformat())
+
+
+def last_error():
+    """The most recent B2 refusal, verbatim ('' if none this process).
+
+    The server's log tail is unusable for this: the 10-second poll loop prints
+    several lines per tick, so anything older than ~30 seconds has scrolled away
+    by the time anyone runs /logs. Surfacing the error over Telegram instead is
+    the only way to diagnose the cloud layer on a machine with no shell."""
+    return _last_error
+
+
+def bucket_stats(prefix="bus-backups"):
+    """(object_count, total_bytes, error_str) for everything under `prefix/`.
+
+    Costs exactly one b2_list_file_names (Class C) per 1,000 objects."""
+    if not is_configured():
+        return (0, 0, "not armed (no bucket name or key file)")
+    if _breaker_open():
+        return (0, 0, f"parked: {_breaker_reason} until {_breaker_until.isoformat()} UTC")
+    try:
+        bucket = _get_bucket()
+        count = total = 0
+        for entry in bucket.ls(f"{prefix}/", recursive=True):
+            file_version = entry[0] if isinstance(entry, tuple) else entry
+            count += 1
+            total += int(getattr(file_version, "size", 0) or 0)
+        return (count, total, "")
+    except Exception as e:
+        _note_failure(e)
+        return (0, 0, f"{type(e).__name__}: {e}")
 
 
 def is_configured():

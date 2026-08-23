@@ -21,6 +21,8 @@ never spends a real transaction. Sections:
   4. The breaker closes itself once that deadline passes.
   5. prune_old_backups keeps the newest N snapshots PLUS the first snapshot of
      every calendar month, ignores non-snapshot objects, and is idempotent.
+  7. last_error() / bucket_stats() - the Telegram-side diagnosis surface, since
+     the poll loop floods monitor.log and nothing older than ~30s survives /logs.
   6. The monitor's failure backoff ladder (30m -> 1h -> 2h -> 4h, capped at 12h)
      replaces the old every-10-seconds retry: ~8,640 attempts/day -> at most ~6.
 """
@@ -35,7 +37,7 @@ calls = {"authorize": 0, "get_bucket": 0, "ls": 0}
 
 class FakeFV:
     def __init__(self, name, store):
-        self.file_name = name; self._store = store
+        self.file_name = name; self._store = store; self.size = 1024
     def delete(self):
         self._store.files = [f for f in self._store.files if f is not self]
 
@@ -137,6 +139,21 @@ check("July + August fully intact",
 check("non-snapshot objects untouched",
       "bus-backups/README.txt" in names and "models/xgb.json" in names)
 check("second prune is a no-op (idempotent)", cloud_sync.prune_old_backups(keep=20) == 0)
+
+print("7. remote diagnosis surface (the server has no shell and an unreadable log tail)")
+cloud_sync._breaker_until = None
+cloud_sync._note_failure(Exception("Cannot upload or copy files, storage cap exceeded."))
+check("last_error() reports the refusal verbatim",
+      "storage cap exceeded" in cloud_sync.last_error())
+count, total, err = cloud_sync.bucket_stats(prefix="bus-backups")
+check("bucket_stats counts every object under the prefix (21 snapshots + README)",
+      count == 22 and err == "")
+check("bucket_stats sums sizes", total == 22 * 1024)
+cloud_sync._note_failure(Exception("Cannot perform the operation, transaction cap exceeded."))
+count, total, err = cloud_sync.bucket_stats(prefix="bus-backups")
+check("bucket_stats refuses to spend a transaction while parked",
+      count == 0 and "parked" in err)
+cloud_sync._breaker_until = None
 
 print("6. monitor backoff arithmetic (30m -> 1h -> 2h -> 4h, capped at 12h)")
 seq = []

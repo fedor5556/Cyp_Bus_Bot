@@ -535,8 +535,84 @@ async def cmd_pushdb(update, context):
     result = await asyncio.to_thread(cloud_sync.push_db_backup, db_path)
     if result:
         await update.message.reply_text(f"DB backup uploaded: {result}")
-    else:
-        await update.message.reply_text("DB backup failed (see server logs).")
+        return
+
+    # "See server logs" was useless advice: the 10-second poll loop floods
+    # monitor.log, so the failure has scrolled away before anyone can read it.
+    # Report the refusal verbatim, and if the bucket is simply full, prune and
+    # retry once - a full bucket is fixed by deleting, not by waiting.
+    reason = cloud_sync.last_error() or "unknown error"
+    await update.message.reply_text(f"DB backup failed:\n{reason}")
+
+    if "storage cap" in reason.lower():
+        await update.message.reply_text("Bucket is full - pruning old backups...")
+        removed = await asyncio.to_thread(cloud_sync.prune_old_backups)
+        if not removed:
+            await update.message.reply_text(
+                f"Prune removed nothing: {cloud_sync.last_error() or 'no eligible snapshots'}")
+            return
+        await update.message.reply_text(f"Pruned {removed} old backup(s). Retrying...")
+        result = await asyncio.to_thread(cloud_sync.push_db_backup, db_path)
+        await update.message.reply_text(
+            f"DB backup uploaded: {result}" if result
+            else f"Still failing:\n{cloud_sync.last_error() or 'unknown error'}")
+
+
+async def cmd_b2(update, context):
+    """Cloud-layer health in one message: armed? breaker? last refusal? how full?
+
+    This exists because the server has no shell and its log tail is drowned by the
+    poll loop -- without it, a silent B2 failure is undiagnosable from Telegram."""
+    if not _is_admin(update):
+        return
+    import cloud_sync
+    lines = [f"Armed: {'yes' if cloud_sync.is_configured() else 'NO (missing bucket or key)'}"]
+
+    is_open, reason, until = cloud_sync.breaker_status()
+    lines.append(f"Breaker: {'OPEN - ' + reason + ' until ' + until + ' UTC' if is_open else 'closed'}")
+    lines.append(f"Last error: {cloud_sync.last_error() or 'none this run'}")
+
+    if cloud_sync.is_configured():
+        count, total, err = await asyncio.to_thread(cloud_sync.bucket_stats)
+        if err:
+            lines.append(f"bus-backups/: could not list - {err}")
+        else:
+            lines.append(f"bus-backups/: {count} object(s), {total / 1024 ** 3:.2f} GB "
+                         f"of the 10 GB free tier")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_b2prune(update, context):
+    """Force the retention prune now: keep the newest N snapshots + monthly anchors.
+    Usage: /b2prune [keep]  (default 20)."""
+    if not _is_admin(update):
+        return
+    import cloud_sync
+    if not cloud_sync.is_configured():
+        await update.message.reply_text("Cloud layer not armed yet (missing B2 key).")
+        return
+
+    keep = 20
+    if context.args:
+        try:
+            keep = max(1, int(context.args[0]))
+        except ValueError:
+            await update.message.reply_text("Usage: /b2prune [keep]  (a number, default 20)")
+            return
+
+    before = await asyncio.to_thread(cloud_sync.bucket_stats)
+    await update.message.reply_text(
+        f"Pruning bus-backups/ down to the newest {keep} + one anchor per month...")
+    removed = await asyncio.to_thread(cloud_sync.prune_old_backups, keep)
+    after = await asyncio.to_thread(cloud_sync.bucket_stats)
+    if not removed:
+        await update.message.reply_text(
+            f"Deleted nothing: {cloud_sync.last_error() or 'nothing was eligible'}")
+        return
+    await update.message.reply_text(
+        f"Deleted {removed} backup(s).\n"
+        f"{before[0]} objects / {before[1] / 1024 ** 3:.2f} GB  ->  "
+        f"{after[0]} objects / {after[1] / 1024 ** 3:.2f} GB")
 
 
 async def cmd_pull(update, context):
@@ -703,6 +779,8 @@ def start_bot():
     # swallow /pushdb, /pull, /armb2, and document uploads.
     app.add_handler(MessageHandler(filters.Document.ALL, document_upload_handler))
     app.add_handler(CommandHandler("pushdb", cmd_pushdb))
+    app.add_handler(CommandHandler("b2", cmd_b2))
+    app.add_handler(CommandHandler("b2prune", cmd_b2prune))
     app.add_handler(CommandHandler("pull", cmd_pull))
     app.add_handler(CommandHandler("armb2", cmd_armb2))
     app.add_handler(CommandHandler("deploy", cmd_deploy))

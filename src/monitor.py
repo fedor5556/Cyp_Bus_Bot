@@ -136,16 +136,22 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
                         if freed:
                             print(f"[{current_time}] Freed space: pruned {freed} old backup(s) "
                                   f"before the next attempt.")
-                        if backup_failures == 3:
+                        # Alert on the FIRST failure, with the refusal verbatim. Waiting
+                        # for a third would take 1.5h of backoff, and monitor.log is
+                        # useless for this: the 10s poll loop prints several lines a
+                        # tick, so the failure scrolls out of /logs within ~30 seconds.
+                        # Telegram is the only readable channel this server has.
+                        if backup_failures == 1:
                             try:
                                 from analysis.predict_eta import send_telegram_alert
                                 open_, reason, until = cloud_sync.breaker_status()
                                 send_telegram_alert(
-                                    f"☁️ Cloud DB backup has failed 3 times in a row"
-                                    + (f" ({reason}, paused until {until} UTC)" if open_ else "")
-                                    + ". Backups are NOT reaching B2 - check the bucket's "
-                                      "storage/transaction caps. Local data collection is "
-                                      "unaffected; retries are backing off, not hammering.")
+                                    "☁️ Cloud DB backup FAILED:\n"
+                                    f"{cloud_sync.last_error() or 'unknown error'}\n"
+                                    + (f"B2 calls paused ({reason}) until {until} UTC.\n" if open_ else "")
+                                    + (f"Pruned {freed} old backup(s) to free space.\n" if freed else "")
+                                    + f"Next attempt in {backup_interval}. Local data "
+                                      "collection is unaffected. /b2 for details.")
                             except Exception as alert_err:
                                 print(f"Backup alert failed: {alert_err}")
                 except Exception as e:
