@@ -603,12 +603,21 @@ async def cmd_b2prune(update, context):
     before = await asyncio.to_thread(cloud_sync.bucket_stats)
     await update.message.reply_text(
         f"Pruning bus-backups/ down to the newest {keep} + one anchor per month...")
+    # Snapshot the error state first: a prune that deletes nothing because nothing
+    # is ELIGIBLE is a success, not a failure, and it leaves last_error() untouched.
+    # Without this comparison the reply printed whatever unrelated error happened to
+    # be sitting in last_error() from earlier in the process, which reads as a crash.
+    err_before = cloud_sync.last_error()
     removed = await asyncio.to_thread(cloud_sync.prune_old_backups, keep)
-    after = await asyncio.to_thread(cloud_sync.bucket_stats)
+    err_after = cloud_sync.last_error()
     if not removed:
+        failed = err_after and err_after != err_before
         await update.message.reply_text(
-            f"Deleted nothing: {cloud_sync.last_error() or 'nothing was eligible'}")
+            f"Prune failed: {err_after}" if failed
+            else f"Nothing to delete - already at {before[0]} object(s), "
+                 f"{before[1] / 1024 ** 3:.2f} GB.")
         return
+    after = await asyncio.to_thread(cloud_sync.bucket_stats)
     await update.message.reply_text(
         f"Deleted {removed} backup(s).\n"
         f"{before[0]} objects / {before[1] / 1024 ** 3:.2f} GB  ->  "
