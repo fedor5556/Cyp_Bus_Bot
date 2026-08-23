@@ -23,6 +23,8 @@ never spends a real transaction. Sections:
      every calendar month, ignores non-snapshot objects, and is idempotent.
   7. last_error() / bucket_stats() - the Telegram-side diagnosis surface, since
      the poll loop floods monitor.log and nothing older than ~30s survives /logs.
+  8. The backup marker's outcome round-trip, including the legacy bare-ISO
+     format already written on the server by the previous deploy.
   6. The monitor's failure backoff ladder (30m -> 1h -> 2h -> 4h, capped at 12h)
      replaces the old every-10-seconds retry: ~8,640 attempts/day -> at most ~6.
 """
@@ -164,6 +166,25 @@ check("backoff ladder", [str(s) for s in seq] ==
 daily_old = 24 * 60 * 60 / 10          # a retry every 10s loop tick
 daily_new = sum(1 for _ in range(2))   # 2 paced attempts/day at worst
 check(f"attempts/day: {daily_old:.0f} -> <= {daily_new + 4}", daily_old > 8000)
+
+print("8. backup marker round-trip (survives restarts, keeps the retry step)")
+def parse_marker(text):
+    """Mirrors the parse in monitor.start_monitoring."""
+    outcome, _, stamp = text.strip().partition(" ")
+    when = datetime.fromisoformat(stamp or outcome)
+    if outcome == "fail":
+        return when, 1, timedelta(minutes=30)
+    return when, 0, timedelta(hours=12)
+
+when, n, interval = parse_marker("fail 2026-08-23T02:58:00")
+check("a failed marker resumes on the 30-minute step, not 12 hours",
+      n == 1 and interval == timedelta(minutes=30) and when.hour == 2)
+when, n, interval = parse_marker("ok 2026-08-23T02:58:00")
+check("a successful marker keeps the 12-hour cadence",
+      n == 0 and interval == timedelta(hours=12))
+when, n, interval = parse_marker("2026-08-23T02:58:00")
+check("a legacy bare-ISO marker (already on the server) still parses",
+      n == 0 and when.minute == 58)
 
 print()
 try:

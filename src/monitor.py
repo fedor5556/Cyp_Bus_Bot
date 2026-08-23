@@ -51,9 +51,20 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
     backup_interval = timedelta(hours=12)
     backup_failures = 0
     last_db_backup = datetime.min
+    # The marker records the OUTCOME as well as the time. Without the outcome, a
+    # restart during an outage would reset the pacing to a full 12 hours and leave
+    # the cloud backups dead until the evening; with it, a restart resumes on the
+    # short retry step instead. It is written pessimistically ("fail") BEFORE each
+    # attempt, so even a crash mid-upload resumes paced rather than hot-looping.
     try:
         with open(backup_marker, "r", encoding="utf-8") as f:
-            last_db_backup = datetime.fromisoformat(f.read().strip())
+            outcome, _, stamp = f.read().strip().partition(" ")
+            last_db_backup = datetime.fromisoformat(stamp or outcome)
+            if outcome == "fail":
+                backup_failures = 1
+                backup_interval = timedelta(minutes=30)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Last cloud backup had "
+                      f"failed; resuming on the 30-minute retry step.")
     except Exception:
         pass
     last_prediction_log = datetime.min # Snapshot ETA predictions every 60s (drift dataset)
@@ -100,17 +111,22 @@ def start_monitoring(interval_seconds=10, schedule_update_interval_hours=12):
             if (datetime.now() - last_db_backup > backup_interval
                     and cloud_sync.is_configured()):
                 last_db_backup = datetime.now()
-                try:
-                    with open(backup_marker, "w", encoding="utf-8") as f:
-                        f.write(last_db_backup.isoformat())
-                except Exception:
-                    pass
+
+                def _mark(outcome):
+                    try:
+                        with open(backup_marker, "w", encoding="utf-8") as f:
+                            f.write(f"{outcome} {last_db_backup.isoformat()}")
+                    except Exception:
+                        pass
+
+                _mark("fail")   # pessimistic; rewritten to "ok" only on success
                 try:
                     db_path = os.path.join(Config.BASE_DIR, "data", "bus_data.db")
                     result = cloud_sync.push_db_backup(db_path)
                     if result:
                         backup_failures = 0
                         backup_interval = timedelta(hours=12)
+                        _mark("ok")
                         print(f"[{current_time}] DB backup pushed to cloud: {result}")
                         # Client-side retention. The B2 lifecycle rule was never
                         # applied by hand, so 12-hourly ~90 MB snapshots marched the
